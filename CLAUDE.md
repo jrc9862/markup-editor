@@ -301,6 +301,17 @@ way), mono accents (CSS vars in `globals.css`).
 8. **Realtime suggesting in rendered mode** — the Suggesting toggle currently
    covers source mode only; rendered mode needs the equivalent interception
    at the ProseMirror transaction level.
+9. **File rename handling** — renaming a file on disk (or in the UI) should
+   update the doc's name/path everywhere: manifest remapping in the CLI,
+   doc_meta, the doc-list tree, and open editor topbars.
+10. **Live, intelligently grouped history** — the history panel should hot-
+    reload as edits land in the current doc, with changes grouped into
+    meaningful versions (e.g. by author + editing burst), not just the
+    fixed ≥60s debounce.
+11. **History as local version preview** — selecting a version shows that
+    version of the document read-only to *just the selecting user* (no
+    diff view, no effect on other collaborators), with restore as an
+    explicit follow-up action.
 
 Shipped from the original roadmap: togglable realtime suggestion mode
 (source), in-rendered-view annotation highlights, cross-mode presence
