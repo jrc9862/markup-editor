@@ -22,6 +22,8 @@ import type {
   SuggestionData,
 } from '@markup/sync-core';
 import { SERVER_HTTP, SERVER_WS, TOKEN, authHeaders } from '@/lib/config';
+import { useMe } from '@/lib/auth';
+import UserMenu from './UserMenu';
 import SourceEditor from './SourceEditor';
 import RenderedEditor from './RenderedEditor';
 import Toolbar from './Toolbar';
@@ -65,6 +67,8 @@ export default function Editor({ docId }: { docId: string }) {
   const [peers, setPeers] = useState<PresenceUser[]>([]);
   const [meta, setMeta] = useState<DocMeta | null>(null);
   const [conn, setConn] = useState<Conn | null>(null);
+  const { me } = useMe();
+  const signedIn = me?.kind === 'user';
 
   const [comments, setComments] = useState<CommentThreadData[]>([]);
   const [suggestions, setSuggestions] = useState<SuggestionData[]>([]);
@@ -153,6 +157,16 @@ export default function Editor({ docId }: { docId: string }) {
     };
   }, [docId]);
 
+  // Once the signed-in identity is known, presence uses the real name
+  // (the provider starts with the guest name before /api/me resolves).
+  useEffect(() => {
+    if (!conn || me?.kind !== 'user') return;
+    if (conn.user.name === me.user!.name) return;
+    const user = makePresence(me.user!.name);
+    conn.provider.setAwarenessField('user', user);
+    setConn({ ...conn, user });
+  }, [me, conn]);
+
   useEffect(() => {
     fetch(`${SERVER_HTTP}/api/docs/${docId}`, { headers: authHeaders() })
       .then((r) => (r.ok ? r.json() : null))
@@ -192,6 +206,7 @@ export default function Editor({ docId }: { docId: string }) {
     addComment(conn.ydoc, conn.ytext, {
       ...selection,
       author: conn.user.name,
+      authorId: me?.kind === 'user' ? me.user!.id : undefined,
       text,
     });
     setComposer(null);
@@ -202,6 +217,7 @@ export default function Editor({ docId }: { docId: string }) {
     addSuggestion(conn.ydoc, conn.ytext, {
       ...selection,
       author: conn.user.name,
+      authorId: me?.kind === 'user' ? me.user!.id : undefined,
       original: snippet(selection),
       proposed,
     });
@@ -243,7 +259,7 @@ export default function Editor({ docId }: { docId: string }) {
               {p.name.slice(0, 2).toUpperCase()}
             </span>
           ))}
-          {conn && (
+          {conn && !signedIn && (
             <button
               className="ghost-btn"
               onClick={renameUser}
@@ -252,6 +268,7 @@ export default function Editor({ docId }: { docId: string }) {
               {conn.user.name}
             </button>
           )}
+          <UserMenu />
         </div>
 
         <div className="mode-toggle">
