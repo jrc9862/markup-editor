@@ -1,8 +1,10 @@
 import pg from 'pg';
 import type {
+  AclEntry,
   ApiTokenMeta,
   AuthUser,
   DocMeta,
+  DocRole,
   TokenScope,
   VersionMeta,
 } from '@markup/sync-core';
@@ -56,6 +58,15 @@ const MIGRATIONS: string[] = [
      token_hash TEXT NOT NULL UNIQUE,
      created_at TEXT NOT NULL,
      last_used_at TEXT
+   )`,
+  // Phase 1 milestone 2: per-doc roles.
+  `ALTER TABLE doc_meta ADD COLUMN owner_id TEXT`,
+  `ALTER TABLE doc_meta ADD COLUMN link_role TEXT`,
+  `CREATE TABLE doc_acl (
+     doc_id TEXT NOT NULL,
+     user_id TEXT NOT NULL,
+     role TEXT NOT NULL,
+     PRIMARY KEY (doc_id, user_id)
    )`,
 ];
 
@@ -124,6 +135,8 @@ interface MetaRow {
   path: string | null;
   created_at: string;
   updated_at: string;
+  owner_id: string | null;
+  link_role: string | null;
 }
 
 function toMeta(row: MetaRow): DocMeta {
@@ -133,6 +146,8 @@ function toMeta(row: MetaRow): DocMeta {
     path: row.path ?? undefined,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    ownerId: row.owner_id ?? undefined,
+    linkRole: (row.link_role as DocMeta['linkRole']) ?? undefined,
   };
 }
 
@@ -143,13 +158,18 @@ export class PostgresMetaStore implements MetaStore {
     await runMigrations(this.pool);
   }
 
-  async create(docId: string, name: string, path?: string): Promise<DocMeta> {
+  async create(
+    docId: string,
+    name: string,
+    path?: string,
+    ownerId?: string,
+  ): Promise<DocMeta> {
     const now = new Date().toISOString();
     await this.pool.query(
-      'INSERT INTO doc_meta (doc_id, name, path, created_at, updated_at) VALUES ($1, $2, $3, $4, $5)',
-      [docId, name, path ?? null, now, now],
+      'INSERT INTO doc_meta (doc_id, name, path, created_at, updated_at, owner_id) VALUES ($1, $2, $3, $4, $5, $6)',
+      [docId, name, path ?? null, now, now, ownerId ?? null],
     );
-    return { docId, name, path, createdAt: now, updatedAt: now };
+    return { docId, name, path, createdAt: now, updatedAt: now, ownerId };
   }
 
   async get(docId: string): Promise<DocMeta | undefined> {
@@ -335,6 +355,74 @@ export class PostgresMetaStore implements MetaStore {
       [userId, id],
     );
     return (res.rowCount ?? 0) > 0;
+  }
+
+  async getUserByEmail(email: string): Promise<AuthUser | undefined> {
+    const { rows } = await this.pool.query<{
+      id: string;
+      email: string;
+      name: string;
+      created_at: string;
+    }>('SELECT id, email, name, created_at FROM users WHERE email = $1', [
+      email,
+    ]);
+    const r = rows[0];
+    return r
+      ? { id: r.id, email: r.email, name: r.name, createdAt: r.created_at }
+      : undefined;
+  }
+
+  // --- Per-doc roles ----------------------------------------------------------
+
+  async getAclRole(docId: string, userId: string): Promise<DocRole | undefined> {
+    const { rows } = await this.pool.query<{ role: DocRole }>(
+      'SELECT role FROM doc_acl WHERE doc_id = $1 AND user_id = $2',
+      [docId, userId],
+    );
+    return rows[0]?.role;
+  }
+
+  async setAclRole(docId: string, userId: string, role: DocRole): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO doc_acl (doc_id, user_id, role) VALUES ($1, $2, $3)
+       ON CONFLICT (doc_id, user_id) DO UPDATE SET role = EXCLUDED.role`,
+      [docId, userId, role],
+    );
+  }
+
+  async removeAclRole(docId: string, userId: string): Promise<boolean> {
+    const res = await this.pool.query(
+      'DELETE FROM doc_acl WHERE doc_id = $1 AND user_id = $2',
+      [docId, userId],
+    );
+    return (res.rowCount ?? 0) > 0;
+  }
+
+  async listAcl(docId: string): Promise<AclEntry[]> {
+    const { rows } = await this.pool.query<{
+      user_id: string;
+      role: DocRole;
+      email: string | null;
+      name: string | null;
+    }>(
+      `SELECT a.user_id, a.role, u.email, u.name
+       FROM doc_acl a LEFT JOIN users u ON u.id = a.user_id
+       WHERE a.doc_id = $1 ORDER BY u.email`,
+      [docId],
+    );
+    return rows.map((r) => ({
+      userId: r.user_id,
+      role: r.role,
+      email: r.email ?? undefined,
+      name: r.name ?? undefined,
+    }));
+  }
+
+  async setLinkRole(docId: string, role: DocRole | 'none'): Promise<void> {
+    await this.pool.query(
+      'UPDATE doc_meta SET link_role = $1 WHERE doc_id = $2',
+      [role, docId],
+    );
   }
 
   async close(): Promise<void> {

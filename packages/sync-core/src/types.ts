@@ -13,6 +13,15 @@ export interface DocMeta {
   createdAt: string;
   /** ISO timestamp of last persisted change. */
   updatedAt: string;
+  /** User id of the creator; absent on docs from before identity existed. */
+  ownerId?: string;
+  /**
+   * Role granted to signed-in users with no explicit ACL entry ('none' =
+   * private). Defaults to 'editor' to preserve open collaboration.
+   */
+  linkRole?: DocRole | 'none';
+  /** The requesting principal's resolved role (GET /api/docs/:id only). */
+  myRole?: DocRole | 'none';
 }
 
 /** Request body for creating a document. */
@@ -62,6 +71,23 @@ export interface ApiTokenMeta {
   scope: TokenScope;
   createdAt: string;
   lastUsedAt?: string;
+}
+
+/**
+ * Per-doc roles, strongest first. Each maps to a maximum capability:
+ * owner/editor → write, suggester → suggest, commenter → comment,
+ * viewer → read. The effective capability of a request is the weaker of
+ * the principal's token scope and its doc role.
+ */
+export type DocRole = 'owner' | 'editor' | 'suggester' | 'commenter' | 'viewer';
+
+/** One explicit per-user grant on a doc. */
+export interface AclEntry {
+  userId: string;
+  role: DocRole;
+  /** Joined for display. */
+  email?: string;
+  name?: string;
 }
 
 /** Response of GET /api/me: who the current credentials belong to. */

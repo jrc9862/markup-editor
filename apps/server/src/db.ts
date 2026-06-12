@@ -1,8 +1,10 @@
 import Database from 'better-sqlite3';
 import type {
+  AclEntry,
   ApiTokenMeta,
   AuthUser,
   DocMeta,
+  DocRole,
   TokenScope,
   VersionMeta,
 } from '@markup/sync-core';
@@ -28,7 +30,12 @@ export interface ApiTokenRow {
 export interface MetaStore {
   /** Create tables / run migrations. Call once before serving. */
   init(): Promise<void>;
-  create(docId: string, name: string, path?: string): Promise<DocMeta>;
+  create(
+    docId: string,
+    name: string,
+    path?: string,
+    ownerId?: string,
+  ): Promise<DocMeta>;
   get(docId: string): Promise<DocMeta | undefined>;
   list(): Promise<DocMeta[]>;
   touch(docId: string): Promise<void>;
@@ -52,6 +59,7 @@ export interface MetaStore {
   /** Insert by email, or refresh the name on an existing user. */
   upsertUser(id: string, email: string, name: string): Promise<AuthUser>;
   getUser(id: string): Promise<AuthUser | undefined>;
+  getUserByEmail(email: string): Promise<AuthUser | undefined>;
   createSession(
     tokenHash: string,
     userId: string,
@@ -65,6 +73,13 @@ export interface MetaStore {
   listApiTokens(userId: string): Promise<ApiTokenMeta[]>;
   deleteApiToken(userId: string, id: string): Promise<boolean>;
 
+  // --- Per-doc roles (Phase 1 milestone 2)
+  getAclRole(docId: string, userId: string): Promise<DocRole | undefined>;
+  setAclRole(docId: string, userId: string, role: DocRole): Promise<void>;
+  removeAclRole(docId: string, userId: string): Promise<boolean>;
+  listAcl(docId: string): Promise<AclEntry[]>;
+  setLinkRole(docId: string, role: DocRole | 'none'): Promise<void>;
+
   close(): Promise<void>;
 }
 
@@ -74,6 +89,8 @@ interface MetaRow {
   path: string | null;
   created_at: string;
   updated_at: string;
+  owner_id: string | null;
+  link_role: string | null;
 }
 
 function toMeta(row: MetaRow): DocMeta {
@@ -83,6 +100,8 @@ function toMeta(row: MetaRow): DocMeta {
     path: row.path ?? undefined,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    ownerId: row.owner_id ?? undefined,
+    linkRole: (row.link_role as DocMeta['linkRole']) ?? undefined,
   };
 }
 
@@ -136,23 +155,40 @@ export class SqliteMetaStore implements MetaStore {
         last_used_at TEXT
       );
     `);
-    // Migration: older databases lack the path column.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS doc_acl (
+        doc_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        role TEXT NOT NULL,
+        PRIMARY KEY (doc_id, user_id)
+      );
+    `);
+    // Migrations: older databases lack these doc_meta columns.
     const cols = this.db.prepare('PRAGMA table_info(doc_meta)').all() as Array<{
       name: string;
     }>;
-    if (!cols.some((c) => c.name === 'path')) {
-      this.db.exec('ALTER TABLE doc_meta ADD COLUMN path TEXT');
+    for (const [col, ddl] of [
+      ['path', 'ALTER TABLE doc_meta ADD COLUMN path TEXT'],
+      ['owner_id', 'ALTER TABLE doc_meta ADD COLUMN owner_id TEXT'],
+      ['link_role', 'ALTER TABLE doc_meta ADD COLUMN link_role TEXT'],
+    ] as const) {
+      if (!cols.some((c) => c.name === col)) this.db.exec(ddl);
     }
   }
 
-  async create(docId: string, name: string, path?: string): Promise<DocMeta> {
+  async create(
+    docId: string,
+    name: string,
+    path?: string,
+    ownerId?: string,
+  ): Promise<DocMeta> {
     const now = new Date().toISOString();
     this.db
       .prepare(
-        'INSERT INTO doc_meta (doc_id, name, path, created_at, updated_at) VALUES (?, ?, ?, ?, ?)',
+        'INSERT INTO doc_meta (doc_id, name, path, created_at, updated_at, owner_id) VALUES (?, ?, ?, ?, ?, ?)',
       )
-      .run(docId, name, path ?? null, now, now);
-    return { docId, name, path, createdAt: now, updatedAt: now };
+      .run(docId, name, path ?? null, now, now, ownerId ?? null);
+    return { docId, name, path, createdAt: now, updatedAt: now, ownerId };
   }
 
   async get(docId: string): Promise<DocMeta | undefined> {
@@ -334,6 +370,58 @@ export class SqliteMetaStore implements MetaStore {
       .prepare('DELETE FROM api_tokens WHERE user_id = ? AND id = ?')
       .run(userId, id);
     return res.changes > 0;
+  }
+
+  async getUserByEmail(email: string): Promise<AuthUser | undefined> {
+    const row = this.db
+      .prepare('SELECT * FROM users WHERE email = ?')
+      .get(email) as
+      | { id: string; email: string; name: string; created_at: string }
+      | undefined;
+    return row
+      ? { id: row.id, email: row.email, name: row.name, createdAt: row.created_at }
+      : undefined;
+  }
+
+  // --- Per-doc roles ----------------------------------------------------------
+
+  async getAclRole(docId: string, userId: string): Promise<DocRole | undefined> {
+    const row = this.db
+      .prepare('SELECT role FROM doc_acl WHERE doc_id = ? AND user_id = ?')
+      .get(docId, userId) as { role: DocRole } | undefined;
+    return row?.role;
+  }
+
+  async setAclRole(docId: string, userId: string, role: DocRole): Promise<void> {
+    this.db
+      .prepare(
+        `INSERT INTO doc_acl (doc_id, user_id, role) VALUES (?, ?, ?)
+         ON CONFLICT (doc_id, user_id) DO UPDATE SET role = excluded.role`,
+      )
+      .run(docId, userId, role);
+  }
+
+  async removeAclRole(docId: string, userId: string): Promise<boolean> {
+    const res = this.db
+      .prepare('DELETE FROM doc_acl WHERE doc_id = ? AND user_id = ?')
+      .run(docId, userId);
+    return res.changes > 0;
+  }
+
+  async listAcl(docId: string): Promise<AclEntry[]> {
+    return this.db
+      .prepare(
+        `SELECT a.user_id AS userId, a.role, u.email, u.name
+         FROM doc_acl a LEFT JOIN users u ON u.id = a.user_id
+         WHERE a.doc_id = ? ORDER BY u.email`,
+      )
+      .all(docId) as AclEntry[];
+  }
+
+  async setLinkRole(docId: string, role: DocRole | 'none'): Promise<void> {
+    this.db
+      .prepare('UPDATE doc_meta SET link_role = ? WHERE doc_id = ?')
+      .run(role, docId);
   }
 
   async close(): Promise<void> {

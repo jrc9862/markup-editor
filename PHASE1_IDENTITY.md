@@ -70,8 +70,13 @@ later milestone (plan §1 last bullet).
    API tokens with scopes, `/api/me`, scope checks on REST, attribution on
    annotations, web sign-in + identity-aware presence. Legacy token still
    full-access.
-2. **Roles & enforcement**: `doc_acl` (owner/editor/suggester/commenter/
-   viewer), share/default roles, Hocuspocus read-only connections for
-   non-editors (suggester/commenter act through REST), role checks on every
-   route, `MARKUP_REQUIRE_AUTH=1` to disable the legacy token, sharing UI.
+2. **Roles & enforcement** (shipped, server side): `doc_acl` +
+   `owner_id`/`link_role` on docs, role resolution owner > ACL > link role
+   (default editor; 'none' = private; legacy principal and unowned docs stay
+   open), effective capability = min(token scope, role) enforced per REST
+   route and on WS connections (read-only below write), owner-only
+   permissions routes, `MARKUP_REQUIRE_AUTH=1` disables the legacy token.
+   Remaining for milestone 3: sharing UI, role-aware editor (read-only mode;
+   REST-backed comment/suggest for suggester/commenter roles, whose local
+   Y.Doc writes won't sync over a read-only connection).
 3. **Workspaces + SAML/SCIM** (Phase 3 territory).
