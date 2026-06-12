@@ -123,6 +123,10 @@ cd apps/web && npx tsc -p tsconfig.json --noEmit
 
 # Add a dependency to one workspace (never bare `npm install <pkg>` at root):
 npm install --workspace @markup/web <pkg>
+
+# Production stack: Postgres + server + web as Docker images (compose `app`
+# profile; Dockerfiles in apps/server and apps/web, built from repo root):
+docker compose --profile app up -d --build
 ```
 
 To exercise a full end-to-end loop: start server + web, then
@@ -134,7 +138,13 @@ Auth is a single shared bearer token for now: `MARKUP_TOKEN` (default
 `dev-token`) on server and CLI, `NEXT_PUBLIC_MARKUP_TOKEN` on web. Other env:
 `PORT`, `MARKUP_DATA_DIR`, `DATABASE_URL` (server — Postgres when set, SQLite
 otherwise); `MARKUP_SERVER`, `MARKUP_WEB` (CLI); `NEXT_PUBLIC_MARKUP_SERVER`
-(web).
+(web). `NEXT_PUBLIC_*` values are inlined into the web bundle at **build
+time** — for a deployed web image they are Docker build args, not runtime env.
+The web app builds with `output: 'standalone'`; its Docker image runs the
+traced server (`node apps/web/server.js`), and the server image runs
+`node apps/server/dist/index.js` with graceful SIGTERM shutdown (flushes
+`onStoreDocument` via `hocuspocus.destroy()` before exit). CI builds both
+images on every push.
 
 ## Gotchas (learned the hard way)
 

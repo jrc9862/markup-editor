@@ -62,3 +62,15 @@ jobs:
       - name: Type-check web
         run: npx tsc -p tsconfig.json --noEmit
         working-directory: apps/web
+
+  # Production images must stay buildable; compose's `app` profile uses these.
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build server image
+        run: docker build -f apps/server/Dockerfile -t markup-server .
+
+      - name: Build web image
+        run: docker build -f apps/web/Dockerfile -t markup-web .

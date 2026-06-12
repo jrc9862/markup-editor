@@ -1,10 +1,18 @@
 # Local Postgres for the production data path. SQLite remains the zero-setup
-# default; to run against Postgres instead:
+# default; to run the dev servers against Postgres instead:
 #
 #   docker compose up -d postgres
 #   DATABASE_URL=postgres://markup:markup@localhost:5432/markup npm run dev:server
 #
 # The same URL in `npm test` enables the Postgres half of the server tests.
+#
+# Full production stack (builds the server and web images):
+#
+#   docker compose --profile app up -d --build
+#
+# Web on :3000, server (REST + WS) on :4000, Postgres state in the `pgdata`
+# volume. Override MARKUP_TOKEN (and for a non-localhost deployment,
+# NEXT_PUBLIC_MARKUP_SERVER — it is baked into the web bundle at build time).
 services:
   postgres:
     image: postgres:16
@@ -16,6 +24,38 @@ services:
       - '5432:5432'
     volumes:
       - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U markup']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  server:
+    profiles: [app]
+    build:
+      context: .
+      dockerfile: apps/server/Dockerfile
+    environment:
+      DATABASE_URL: postgres://markup:markup@postgres:5432/markup
+      MARKUP_TOKEN: ${MARKUP_TOKEN:-dev-token}
+    ports:
+      - '4000:4000'
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  web:
+    profiles: [app]
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      args:
+        NEXT_PUBLIC_MARKUP_SERVER: ${NEXT_PUBLIC_MARKUP_SERVER:-http://localhost:4000}
+        NEXT_PUBLIC_MARKUP_TOKEN: ${MARKUP_TOKEN:-dev-token}
+    ports:
+      - '3000:3000'
+    depends_on:
+      - server
 
 volumes:
   pgdata:
