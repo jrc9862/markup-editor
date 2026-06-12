@@ -1,0 +1,20 @@
+{
+  "name": "markup-editor",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Google Docs for Markdown — real-time multiplayer editing on portable .md files",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "dev:server": "npm run dev --workspace @markup/server",
+    "dev:web": "npm run dev --workspace @markup/web",
+    "test": "npm run test --workspaces --if-present",
+    "cli": "npm run --workspace @markup/cli start --"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
