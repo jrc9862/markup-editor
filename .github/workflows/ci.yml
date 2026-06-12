@@ -9,6 +9,24 @@ on:
 jobs:
   ci:
     runs-on: ubuntu-latest
+
+    # Postgres for the @markup/server data-layer tests (the suite skips the
+    # Postgres half when DATABASE_URL is unset, e.g. on local machines).
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: markup
+          POSTGRES_PASSWORD: markup
+          POSTGRES_DB: markup_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U markup"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
     steps:
       - uses: actions/checkout@v5
 
@@ -29,6 +47,8 @@ jobs:
 
       - name: Test
         run: npm test
+        env:
+          DATABASE_URL: postgres://markup:markup@localhost:5432/markup_test
 
       - name: Type-check sync-core
         run: npx tsc -p packages/sync-core/tsconfig.json --noEmit
