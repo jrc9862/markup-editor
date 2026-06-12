@@ -1,5 +1,23 @@
 import Database from 'better-sqlite3';
-import type { DocMeta, VersionMeta } from '@markup/sync-core';
+import type {
+  ApiTokenMeta,
+  AuthUser,
+  DocMeta,
+  TokenScope,
+  VersionMeta,
+} from '@markup/sync-core';
+
+export interface SessionRow {
+  userId: string;
+  expiresAt: string;
+}
+
+export interface ApiTokenRow {
+  id: string;
+  userId: string;
+  name: string;
+  scope: TokenScope;
+}
 
 /**
  * Metadata store for documents: doc names/paths plus the edit-history
@@ -29,6 +47,24 @@ export interface MetaStore {
     docId: string,
     versionId: number,
   ): Promise<string | undefined>;
+
+  // --- Identity (Phase 1). Sessions and API tokens store sha256 hashes only.
+  /** Insert by email, or refresh the name on an existing user. */
+  upsertUser(id: string, email: string, name: string): Promise<AuthUser>;
+  getUser(id: string): Promise<AuthUser | undefined>;
+  createSession(
+    tokenHash: string,
+    userId: string,
+    expiresAt: string,
+  ): Promise<void>;
+  getSession(tokenHash: string): Promise<SessionRow | undefined>;
+  deleteSession(tokenHash: string): Promise<void>;
+  createApiToken(t: ApiTokenRow & { tokenHash: string }): Promise<void>;
+  /** Look up by hash and bump last_used_at. */
+  getApiTokenByHash(tokenHash: string): Promise<ApiTokenRow | undefined>;
+  listApiTokens(userId: string): Promise<ApiTokenMeta[]>;
+  deleteApiToken(userId: string, id: string): Promise<boolean>;
+
   close(): Promise<void>;
 }
 
@@ -78,6 +114,27 @@ export class SqliteMetaStore implements MetaStore {
       );
       CREATE INDEX IF NOT EXISTS idx_versions_doc
         ON doc_versions (doc_id, id DESC);
+      CREATE TABLE IF NOT EXISTS users (
+        id TEXT PRIMARY KEY,
+        email TEXT NOT NULL UNIQUE,
+        name TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS sessions (
+        token_hash TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS api_tokens (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        scope TEXT NOT NULL,
+        token_hash TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL,
+        last_used_at TEXT
+      );
     `);
     // Migration: older databases lack the path column.
     const cols = this.db.prepare('PRAGMA table_info(doc_meta)').all() as Array<{
@@ -166,6 +223,117 @@ export class SqliteMetaStore implements MetaStore {
       .prepare('SELECT content FROM doc_versions WHERE doc_id = ? AND id = ?')
       .get(docId, versionId) as { content: string } | undefined;
     return row?.content;
+  }
+
+  // --- Identity -------------------------------------------------------------
+
+  async upsertUser(id: string, email: string, name: string): Promise<AuthUser> {
+    const existing = this.db
+      .prepare('SELECT * FROM users WHERE email = ?')
+      .get(email) as
+      | { id: string; email: string; name: string; created_at: string }
+      | undefined;
+    if (existing) {
+      if (existing.name !== name) {
+        this.db
+          .prepare('UPDATE users SET name = ? WHERE id = ?')
+          .run(name, existing.id);
+      }
+      return {
+        id: existing.id,
+        email: existing.email,
+        name,
+        createdAt: existing.created_at,
+      };
+    }
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        'INSERT INTO users (id, email, name, created_at) VALUES (?, ?, ?, ?)',
+      )
+      .run(id, email, name, now);
+    return { id, email, name, createdAt: now };
+  }
+
+  async getUser(id: string): Promise<AuthUser | undefined> {
+    const row = this.db.prepare('SELECT * FROM users WHERE id = ?').get(id) as
+      | { id: string; email: string; name: string; created_at: string }
+      | undefined;
+    return row
+      ? { id: row.id, email: row.email, name: row.name, createdAt: row.created_at }
+      : undefined;
+  }
+
+  async createSession(
+    tokenHash: string,
+    userId: string,
+    expiresAt: string,
+  ): Promise<void> {
+    this.db
+      .prepare(
+        'INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)',
+      )
+      .run(tokenHash, userId, new Date().toISOString(), expiresAt);
+  }
+
+  async getSession(tokenHash: string): Promise<SessionRow | undefined> {
+    const row = this.db
+      .prepare('SELECT user_id, expires_at FROM sessions WHERE token_hash = ?')
+      .get(tokenHash) as { user_id: string; expires_at: string } | undefined;
+    return row ? { userId: row.user_id, expiresAt: row.expires_at } : undefined;
+  }
+
+  async deleteSession(tokenHash: string): Promise<void> {
+    this.db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(tokenHash);
+  }
+
+  async createApiToken(t: ApiTokenRow & { tokenHash: string }): Promise<void> {
+    this.db
+      .prepare(
+        'INSERT INTO api_tokens (id, user_id, name, scope, token_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+      )
+      .run(t.id, t.userId, t.name, t.scope, t.tokenHash, new Date().toISOString());
+  }
+
+  async getApiTokenByHash(tokenHash: string): Promise<ApiTokenRow | undefined> {
+    const row = this.db
+      .prepare('SELECT id, user_id, name, scope FROM api_tokens WHERE token_hash = ?')
+      .get(tokenHash) as
+      | { id: string; user_id: string; name: string; scope: TokenScope }
+      | undefined;
+    if (!row) return undefined;
+    this.db
+      .prepare('UPDATE api_tokens SET last_used_at = ? WHERE id = ?')
+      .run(new Date().toISOString(), row.id);
+    return { id: row.id, userId: row.user_id, name: row.name, scope: row.scope };
+  }
+
+  async listApiTokens(userId: string): Promise<ApiTokenMeta[]> {
+    const rows = this.db
+      .prepare(
+        'SELECT id, name, scope, created_at, last_used_at FROM api_tokens WHERE user_id = ? ORDER BY created_at DESC',
+      )
+      .all(userId) as Array<{
+      id: string;
+      name: string;
+      scope: TokenScope;
+      created_at: string;
+      last_used_at: string | null;
+    }>;
+    return rows.map((r) => ({
+      id: r.id,
+      name: r.name,
+      scope: r.scope,
+      createdAt: r.created_at,
+      lastUsedAt: r.last_used_at ?? undefined,
+    }));
+  }
+
+  async deleteApiToken(userId: string, id: string): Promise<boolean> {
+    const res = this.db
+      .prepare('DELETE FROM api_tokens WHERE user_id = ? AND id = ?')
+      .run(userId, id);
+    return res.changes > 0;
   }
 
   async close(): Promise<void> {

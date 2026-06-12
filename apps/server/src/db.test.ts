@@ -43,6 +43,54 @@ function metaStoreContract(makeStore: () => Promise<MetaStore>) {
     expect(list.map((d) => d.docId)).toEqual(['doc-1', 'doc-2']);
   });
 
+  it('upserts users by email with a stable id', async () => {
+    const created = await store.upsertUser('u-1', 'a@example.com', 'Ada');
+    expect(created.id).toBe('u-1');
+
+    // Same email, new name and candidate id: keeps the original id.
+    const updated = await store.upsertUser('u-2', 'a@example.com', 'Ada L.');
+    expect(updated.id).toBe('u-1');
+    expect(updated.name).toBe('Ada L.');
+    expect(await store.getUser('u-1')).toEqual(updated);
+    expect(await store.getUser('u-2')).toBeUndefined();
+  });
+
+  it('round-trips sessions', async () => {
+    await store.createSession('hash-1', 'u-1', '2099-01-01T00:00:00.000Z');
+    expect(await store.getSession('hash-1')).toEqual({
+      userId: 'u-1',
+      expiresAt: '2099-01-01T00:00:00.000Z',
+    });
+    await store.deleteSession('hash-1');
+    expect(await store.getSession('hash-1')).toBeUndefined();
+  });
+
+  it('manages API tokens by hash, scoped per user', async () => {
+    await store.createApiToken({
+      id: 'tok-1',
+      userId: 'u-1',
+      name: 'ci-bot',
+      scope: 'suggest',
+      tokenHash: 'th-1',
+    });
+    expect(await store.getApiTokenByHash('th-1')).toEqual({
+      id: 'tok-1',
+      userId: 'u-1',
+      name: 'ci-bot',
+      scope: 'suggest',
+    });
+    expect(await store.getApiTokenByHash('nope')).toBeUndefined();
+
+    const listed = await store.listApiTokens('u-1');
+    expect(listed).toHaveLength(1);
+    expect(listed[0].lastUsedAt).toBeDefined(); // bumped by the hash lookup
+
+    // Deleting someone else's token is a no-op.
+    expect(await store.deleteApiToken('u-other', 'tok-1')).toBe(false);
+    expect(await store.deleteApiToken('u-1', 'tok-1')).toBe(true);
+    expect(await store.getApiTokenByHash('th-1')).toBeUndefined();
+  });
+
   it('debounces version snapshots', async () => {
     expect(await store.maybeAddVersion('doc-1', 'v1', 0)).toBe(true);
     // identical content → no new version, regardless of interval

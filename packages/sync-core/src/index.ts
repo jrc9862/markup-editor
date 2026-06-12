@@ -31,4 +31,8 @@ export type {
   PresenceUser,
   Manifest,
   VersionMeta,
+  TokenScope,
+  AuthUser,
+  ApiTokenMeta,
+  MeResponse,
 } from './types.js';
