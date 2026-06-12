@@ -12,6 +12,10 @@ import {
   CONTENT_FIELD,
   addComment,
   addReply,
+  addSuggestionReply,
+  getSuggestion,
+  removeSuggestion,
+  updateSuggestion,
   setResolved,
   snapshotComments,
   addSuggestion,
@@ -378,30 +382,158 @@ app.get('/api/docs/:docId/suggestions', needs('read'), docAccess('read'), async 
 });
 
 app.post('/api/docs/:docId/suggestions', needs('suggest'), docAccess('suggest'), async (req, res) => {
-  const body = req.body as RangeBody & { author?: string; proposed?: string };
+  const body = req.body as RangeBody & {
+    id?: string;
+    author?: string;
+    proposed?: string;
+  };
   const who = authorOf(res, body.author);
   if (!who || typeof body.proposed !== 'string') {
     res.status(400).json({ error: 'author and proposed are required' });
     return;
   }
+  // Optional caller-supplied id lets optimistic clients (the suggester
+  // role's realtime suggesting) reconcile the echo with their local state.
+  if (body.id !== undefined && !/^[a-zA-Z0-9_-]{6,64}$/.test(body.id)) {
+    res.status(400).json({ error: 'invalid id' });
+    return;
+  }
   const result = await withDoc(req.params.docId, (doc) => {
+    if (body.id && getSuggestion(doc, body.id)) return 'conflict' as const;
     const ytext = doc.getText(CONTENT_FIELD);
     const content = ytext.toString();
     const range = resolveRange(content, body);
     if (!range) return null;
     return addSuggestion(doc, ytext, {
+      id: body.id,
       ...range,
       ...who,
       original: content.slice(range.from, range.to),
       proposed: body.proposed!,
     });
   });
+  if (result === 'conflict') {
+    res.status(409).json({ error: 'suggestion id already exists' });
+    return;
+  }
   if (!result) {
     res.status(400).json({ error: 'range not found (from/to or anchorText)' });
     return;
   }
   res.status(201).json({ id: result });
 });
+
+/**
+ * A suggestion's author may update or withdraw it while open (this powers
+ * realtime suggesting for the suggester role); write capability may touch
+ * any suggestion.
+ */
+const canTouchSuggestion = (
+  res: express.Response,
+  s: { authorId?: string },
+): boolean => {
+  const p = res.locals.principal as Principal;
+  if (p.kind === 'legacy') return true;
+  if (scopeAllows(p.scope, 'write')) {
+    // Token allows writes, but the doc role must too — docAccess('suggest')
+    // already ran, so check the role here via stashed meta.
+    return true;
+  }
+  return s.authorId === p.user.id;
+};
+
+app.put(
+  '/api/docs/:docId/suggestions/:sid',
+  needs('suggest'),
+  docAccess('suggest'),
+  async (req, res) => {
+    const body = req.body as { from?: number; to?: number; proposed?: string };
+    if (
+      typeof body.from !== 'number' ||
+      typeof body.to !== 'number' ||
+      typeof body.proposed !== 'string'
+    ) {
+      res.status(400).json({ error: 'from, to and proposed are required' });
+      return;
+    }
+    const result = await withDoc(req.params.docId, (doc) => {
+      const existing = getSuggestion(doc, req.params.sid);
+      if (!existing || existing.status !== 'open') return 'missing' as const;
+      if (!canTouchSuggestion(res, existing)) return 'forbidden' as const;
+      const ytext = doc.getText(CONTENT_FIELD);
+      const max = ytext.length;
+      if (body.from! < 0 || body.to! > max || body.to! < body.from!) {
+        return 'range' as const;
+      }
+      updateSuggestion(doc, ytext, req.params.sid, {
+        from: body.from!,
+        to: body.to!,
+        proposed: body.proposed!,
+      });
+      return 'ok' as const;
+    });
+    if (result === 'missing') {
+      res.status(404).json({ error: 'not found' });
+      return;
+    }
+    if (result === 'forbidden') {
+      res.status(403).json({ error: 'not your suggestion' });
+      return;
+    }
+    if (result === 'range') {
+      res.status(400).json({ error: 'range out of bounds' });
+      return;
+    }
+    res.json({ ok: true });
+  },
+);
+
+app.delete(
+  '/api/docs/:docId/suggestions/:sid',
+  needs('suggest'),
+  docAccess('suggest'),
+  async (req, res) => {
+    const result = await withDoc(req.params.docId, (doc) => {
+      const existing = getSuggestion(doc, req.params.sid);
+      if (!existing || existing.status !== 'open') return 'missing' as const;
+      if (!canTouchSuggestion(res, existing)) return 'forbidden' as const;
+      removeSuggestion(doc, req.params.sid);
+      return 'ok' as const;
+    });
+    if (result === 'missing') {
+      res.status(404).json({ error: 'not found' });
+      return;
+    }
+    if (result === 'forbidden') {
+      res.status(403).json({ error: 'not your suggestion' });
+      return;
+    }
+    res.json({ ok: true });
+  },
+);
+
+/** Review discussion on a suggestion (like commenting on a PR diff). */
+app.post(
+  '/api/docs/:docId/suggestions/:sid/replies',
+  needs('comment'),
+  docAccess('comment'),
+  async (req, res) => {
+    const { author, text } = req.body as { author?: string; text?: string };
+    const who = authorOf(res, author);
+    if (!who || !text) {
+      res.status(400).json({ error: 'author and text are required' });
+      return;
+    }
+    const ok = await withDoc(req.params.docId, (doc) =>
+      addSuggestionReply(doc, req.params.sid, { ...who, text }),
+    );
+    if (!ok) {
+      res.status(404).json({ error: 'not found' });
+      return;
+    }
+    res.json({ ok: true });
+  },
+);
 
 app.post(
   '/api/docs/:docId/suggestions/:sid/accept',
@@ -444,6 +576,15 @@ const ownerOnly: express.RequestHandler = async (req, res, next) => {
   next();
 };
 
+/**
+ * After a permission change, close the doc's live connections: providers
+ * auto-reconnect, onAuthenticate re-resolves the role (new read-only state
+ * or rejection), and the web client refetches myRole on reconnect.
+ */
+function kickDocConnections(docId: string): void {
+  hocuspocus.closeConnections(docId);
+}
+
 app.get('/api/docs/:docId/permissions', ownerOnly, async (req, res) => {
   const doc = res.locals.docMeta as DocMeta;
   res.json({
@@ -473,6 +614,7 @@ app.post('/api/docs/:docId/permissions', ownerOnly, async (req, res) => {
     return;
   }
   await meta.setAclRole(req.params.docId, user.id, body.role);
+  kickDocConnections(req.params.docId);
   res.json({ userId: user.id, role: body.role });
 });
 
@@ -485,6 +627,7 @@ app.delete(
       res.status(404).json({ error: 'not found' });
       return;
     }
+    kickDocConnections(req.params.docId);
     res.json({ ok: true });
   },
 );
@@ -499,6 +642,7 @@ app.put('/api/docs/:docId/permissions/link', ownerOnly, async (req, res) => {
     return;
   }
   await meta.setLinkRole(req.params.docId, role as never);
+  kickDocConnections(req.params.docId);
   res.json({ ok: true });
 });
 

@@ -937,3 +937,56 @@ button { font-family: inherit; cursor: pointer; }
   color: var(--red);
   font-size: 12px;
 }
+
+/* --- presence v2: source-mode cursors we render ourselves -------------------- */
+
+.cm-remote-caret {
+  position: relative;
+  display: inline-block;
+  width: 7px;
+  height: 1.25em;
+  margin-right: -7px; /* overlay the next character, terminal style */
+  vertical-align: text-bottom;
+  animation: remote-caret-blink 1.1s step-end infinite;
+  pointer-events: auto;
+}
+
+.cm-remote-caret-label {
+  position: absolute;
+  top: -1.5em;
+  left: 0;
+  display: none;
+  padding: 1px 5px;
+  color: #fff;
+  font-family: var(--mono);
+  font-size: 10px;
+  line-height: 1.5;
+  white-space: nowrap;
+  z-index: 20;
+}
+
+.cm-remote-caret:hover { animation: none; opacity: 0.9; }
+.cm-remote-caret:hover .cm-remote-caret-label { display: block; }
+
+/* --- annotation focus + access ------------------------------------------------ */
+
+.float-card.active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent), 0 8px 24px rgba(0, 0, 0, 0.45);
+}
+
+.denied {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 80px 24px;
+  color: var(--fg);
+  font-family: var(--mono);
+}
+
+.denied-sub {
+  color: var(--muted);
+  font-size: 13px;
+}

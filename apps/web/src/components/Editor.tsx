@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import * as Y from 'yjs';
 import { HocuspocusProvider } from '@hocuspocus/provider';
 import {
@@ -8,6 +8,10 @@ import {
   makePresence,
   addComment,
   addReply,
+  addSuggestionReply,
+  getSuggestion,
+  updateSuggestion,
+  removeSuggestion,
   setResolved,
   snapshotComments,
   addSuggestion,
@@ -31,6 +35,7 @@ import Toolbar from './Toolbar';
 import FloatingAnnotations from './FloatingAnnotations';
 import HistoryPanel from './HistoryPanel';
 import type { EditorHandle } from './format';
+import type { SuggestionStore } from './suggestMode';
 
 type Mode = 'source' | 'rendered';
 
@@ -68,6 +73,8 @@ export default function Editor({ docId }: { docId: string }) {
   const [peers, setPeers] = useState<PresenceUser[]>([]);
   const [meta, setMeta] = useState<DocMeta | null>(null);
   const [conn, setConn] = useState<Conn | null>(null);
+  const [denied, setDenied] = useState(false);
+  const [cursorOffset, setCursorOffset] = useState<number | null>(null);
   const { me } = useMe();
   const signedIn = me?.kind === 'user';
 
@@ -82,20 +89,27 @@ export default function Editor({ docId }: { docId: string }) {
   const canEdit = cap >= 3;
   const canSuggest = cap >= 2;
   const canComment = cap >= 1;
+  // The suggester role is a full editing experience locked into suggesting
+  // mode: typing and toolbar actions all become suggestions.
+  const lockedSuggest = !canEdit && canSuggest;
 
   // Below write capability the WS connection is read-only, so local Y.Doc
   // writes would silently not sync — annotation actions go through REST
   // instead (the server applies them via a direct connection and they come
   // back over the wire like any remote edit).
-  const restPost = useCallback(
-    (path: string, body: unknown) =>
+  const restCall = useCallback(
+    (method: string, path: string, body?: unknown) =>
       fetch(`${SERVER_HTTP}/api/docs/${docId}${path}`, {
-        method: 'POST',
+        method,
         headers: { ...authHeaders(), 'Content-Type': 'application/json' },
         credentials: 'include',
-        body: JSON.stringify(body),
-      }).catch(() => {}),
+        body: body === undefined ? undefined : JSON.stringify(body),
+      }).catch(() => undefined),
     [docId],
+  );
+  const restPost = useCallback(
+    (path: string, body: unknown) => restCall('POST', path, body),
+    [restCall],
   );
 
   const [comments, setComments] = useState<CommentThreadData[]>([]);
@@ -195,15 +209,41 @@ export default function Editor({ docId }: { docId: string }) {
     setConn({ ...conn, user });
   }, [me, conn]);
 
-  useEffect(() => {
+  const refetchMeta = useCallback(() => {
     fetch(`${SERVER_HTTP}/api/docs/${docId}`, {
       headers: authHeaders(),
       credentials: 'include',
     })
-      .then((r) => (r.ok ? r.json() : null))
-      .then(setMeta)
+      .then(async (r) => {
+        if (r.status === 403 || r.status === 401) {
+          setDenied(true);
+          return;
+        }
+        if (r.ok) {
+          setDenied(false);
+          setMeta((await r.json()) as DocMeta);
+        }
+      })
       .catch(() => {});
   }, [docId]);
+
+  useEffect(refetchMeta, [refetchMeta]);
+
+  // Hot permission reload: the server closes the doc's connections when
+  // sharing changes; the provider reconnects, onAuthenticate re-resolves the
+  // role, and re-fetching myRole here flips the UI live. A revoked user's
+  // reconnect fails authentication → lock screen.
+  useEffect(() => {
+    if (!conn) return;
+    const onSynced = () => refetchMeta();
+    const onAuthFail = () => setDenied(true);
+    conn.provider.on('synced', onSynced);
+    conn.provider.on('authenticationFailed', onAuthFail);
+    return () => {
+      conn.provider.off('synced', onSynced);
+      conn.provider.off('authenticationFailed', onAuthFail);
+    };
+  }, [conn, refetchMeta]);
 
   const switchMode = (m: Mode) => {
     setMode(m);
@@ -231,6 +271,129 @@ export default function Editor({ docId }: { docId: string }) {
       conn && r ? conn.ytext.toString().slice(r.from, r.to) : '',
     [conn],
   );
+
+  // --- suggest-mode stores ----------------------------------------------------
+  //
+  // Editors write suggestion objects straight into the shared Y.Doc. The
+  // suggester role's WS connection is read-only, so its realtime suggesting
+  // uses an optimistic local overlay synced through REST; the server echo
+  // arrives over the wire and replaces the overlay entry.
+
+  const [overlayTick, setOverlayTick] = useState(0);
+  const overlayRef = useRef(new Map<string, SuggestionData>());
+  const putTimers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+  const suggestionsRef = useRef(suggestions);
+  suggestionsRef.current = suggestions;
+
+  const localStore: SuggestionStore = useMemo(
+    () => ({
+      add: (o) => {
+        if (!conn) return '';
+        return addSuggestion(conn.ydoc, conn.ytext, {
+          ...o,
+          author: conn.user.name,
+          authorId: me?.kind === 'user' ? me.user!.id : undefined,
+        });
+      },
+      get: (id) => (conn ? getSuggestion(conn.ydoc, id) : null),
+      update: (id, o) => {
+        if (conn) updateSuggestion(conn.ydoc, conn.ytext, id, o);
+      },
+      remove: (id) => {
+        if (conn) removeSuggestion(conn.ydoc, id);
+      },
+    }),
+    [conn, me],
+  );
+
+  const restStore: SuggestionStore = useMemo(
+    () => ({
+      add: (o) => {
+        const id =
+          Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+        overlayRef.current.set(id, {
+          id,
+          from: o.from,
+          to: o.to,
+          author: me?.user?.name ?? 'me',
+          authorId: me?.user?.id,
+          original: o.original,
+          proposed: o.proposed,
+          status: 'open',
+          createdAt: new Date().toISOString(),
+          replies: [],
+        });
+        setOverlayTick((t) => t + 1);
+        void restPost('/suggestions', {
+          id,
+          from: o.from,
+          to: o.to,
+          proposed: o.proposed,
+        });
+        return id;
+      },
+      get: (id) =>
+        overlayRef.current.get(id) ??
+        suggestionsRef.current.find((x) => x.id === id) ??
+        null,
+      update: (id, o) => {
+        const cur =
+          overlayRef.current.get(id) ??
+          suggestionsRef.current.find((x) => x.id === id);
+        if (!cur) return;
+        overlayRef.current.set(id, {
+          ...cur,
+          from: o.from,
+          to: o.to,
+          proposed: o.proposed,
+          original: conn ? conn.ytext.toString().slice(o.from, o.to) : cur.original,
+        });
+        setOverlayTick((t) => t + 1);
+        const old = putTimers.current.get(id);
+        if (old) clearTimeout(old);
+        putTimers.current.set(
+          id,
+          setTimeout(() => {
+            putTimers.current.delete(id);
+            void restCall('PUT', `/suggestions/${id}`, o);
+          }, 250),
+        );
+      },
+      remove: (id) => {
+        overlayRef.current.delete(id);
+        const old = putTimers.current.get(id);
+        if (old) clearTimeout(old);
+        putTimers.current.delete(id);
+        setOverlayTick((t) => t + 1);
+        void restCall('DELETE', `/suggestions/${id}`);
+      },
+    }),
+    [conn, me, restPost, restCall],
+  );
+
+  // Drop overlay entries once the server echo has caught up.
+  useEffect(() => {
+    let changed = false;
+    for (const [id, o] of overlayRef.current) {
+      const server = suggestions.find((x) => x.id === id);
+      if (server && server.proposed === o.proposed && !putTimers.current.has(id)) {
+        overlayRef.current.delete(id);
+        changed = true;
+      }
+    }
+    if (changed) setOverlayTick((t) => t + 1);
+  }, [suggestions]);
+
+  const mergedSuggestions = useMemo(() => {
+    const overlay = overlayRef.current;
+    if (overlay.size === 0) return suggestions;
+    const out = suggestions.map((x) => overlay.get(x.id) ?? x);
+    for (const [id, o] of overlay) {
+      if (!suggestions.some((x) => x.id === id)) out.push(o);
+    }
+    return out;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [suggestions, overlayTick]);
 
   const submitComment = (text: string) => {
     if (!conn || !selection) return;
@@ -274,6 +437,56 @@ export default function Editor({ docId }: { docId: string }) {
   const commentRanges = comments
     .filter((c) => !c.resolved && c.from !== null && c.to !== null)
     .map((c) => ({ from: c.from!, to: c.to! }));
+
+  const activeIds = useMemo(() => {
+    if (cursorOffset === null) return [] as string[];
+    const ids: string[] = [];
+    for (const c of comments) {
+      if (
+        !c.resolved &&
+        c.from !== null &&
+        c.to !== null &&
+        c.from <= cursorOffset &&
+        cursorOffset <= c.to
+      ) {
+        ids.push(c.id);
+      }
+    }
+    for (const sg of mergedSuggestions) {
+      if (
+        sg.status === 'open' &&
+        sg.from !== null &&
+        sg.to !== null &&
+        sg.from <= cursorOffset &&
+        cursorOffset <= sg.to
+      ) {
+        ids.push(sg.id);
+      }
+    }
+    return ids;
+  }, [cursorOffset, comments, mergedSuggestions]);
+
+  if (denied) {
+    return (
+      <div className="app">
+        <header className="topbar">
+          <a className="logo" href="/" title="All documents">
+            ⌘
+          </a>
+          <div className="doc-title">
+            <span className="doc-name">{meta?.path ?? meta?.name ?? docId}</span>
+          </div>
+          <UserMenu />
+        </header>
+        <div className="denied">
+          <p>You no longer have access to this document.</p>
+          <p className="denied-sub">
+            Ask the owner to share it with you, then reload.
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="app">
@@ -340,10 +553,14 @@ export default function Editor({ docId }: { docId: string }) {
       <Toolbar
         // Re-read the handle when an editor (re)registers it.
         key={handleVersion}
-        format={canEdit ? (handleRef.current?.format ?? null) : null}
+        format={
+          canEdit || (lockedSuggest && mode === 'source')
+            ? (handleRef.current?.format ?? null)
+            : null
+        }
         canAnnotate={canAnnotate && canComment}
         canSuggestAction={canSuggest}
-        suggesting={mode === 'source' && suggesting && canEdit}
+        suggesting={mode === 'source' && (suggesting || lockedSuggest)}
         suggestingAvailable={mode === 'source' && canEdit}
         onSuggestingChange={setSuggesting}
         onComment={() => setComposer('comment')}
@@ -362,16 +579,13 @@ export default function Editor({ docId }: { docId: string }) {
                   provider={conn.provider}
                   user={conn.user}
                   commentRanges={commentRanges}
-                  suggestions={suggestions}
-                  suggesting={suggesting && canEdit}
-                  readOnly={!canEdit}
-                  canModerate={canEdit}
-                  onAccept={(id) =>
-                    acceptSuggestion(conn.ydoc, conn.ytext, id)
-                  }
-                  onReject={(id) => rejectSuggestion(conn.ydoc, id)}
+                  suggestions={mergedSuggestions}
+                  suggesting={(suggesting && canEdit) || lockedSuggest}
+                  suggestStore={lockedSuggest ? restStore : localStore}
+                  readOnly={!canEdit && !lockedSuggest}
                   focusRange={focusRange}
                   onSelectionChange={setSelection}
+                  onCursorChange={setCursorOffset}
                   onReady={onEditorReady}
                 />
               ) : (
@@ -379,7 +593,7 @@ export default function Editor({ docId }: { docId: string }) {
                   ytext={conn.ytext}
                   provider={conn.provider}
                   commentRanges={commentRanges}
-                  suggestionRanges={suggestions
+                  suggestionRanges={mergedSuggestions
                     .filter(
                       (s) =>
                         s.status === 'open' && s.from !== null && s.to !== null,
@@ -388,6 +602,7 @@ export default function Editor({ docId }: { docId: string }) {
                   focusRange={focusRange}
                   readOnly={!canEdit}
                   onSelectionChange={setSelection}
+                  onCursorChange={setCursorOffset}
                   onReady={onEditorReady}
                 />
               )}
@@ -396,8 +611,8 @@ export default function Editor({ docId }: { docId: string }) {
             {conn && synced && (
               <FloatingAnnotations
                 comments={comments}
-                suggestions={suggestions}
-                showSuggestions={mode === 'rendered'}
+                suggestions={mergedSuggestions}
+                showSuggestions={true}
                 composer={composer}
                 composerSnippet={snippet(selection)}
                 selection={selection}
@@ -421,6 +636,16 @@ export default function Editor({ docId }: { docId: string }) {
                 onAccept={(id) => acceptSuggestion(conn.ydoc, conn.ytext, id)}
                 onReject={(id) => rejectSuggestion(conn.ydoc, id)}
                 onJump={jumpTo}
+                onSuggestionReply={(sid, text) =>
+                  canEdit
+                    ? addSuggestionReply(conn.ydoc, sid, {
+                        author: conn.user.name,
+                        authorId: me?.kind === 'user' ? me.user!.id : undefined,
+                        text,
+                      })
+                    : void restPost(`/suggestions/${sid}/replies`, { text })
+                }
+                activeIds={activeIds}
                 canComment={canComment}
                 canModerate={canEdit}
                 currentContent={() => conn.ytext.toString()}

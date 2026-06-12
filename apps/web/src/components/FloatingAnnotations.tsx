@@ -30,6 +30,10 @@ interface Props {
   onAccept: (id: string) => void;
   onReject: (id: string) => void;
   onJump: (r: Range) => void;
+  /** Review discussion on a suggestion. */
+  onSuggestionReply: (suggestionId: string, text: string) => void;
+  /** Cards whose anchored range contains the user's cursor. */
+  activeIds: string[];
   /** Capability gates from the resolved doc role. */
   canComment: boolean;
   canModerate: boolean;
@@ -98,6 +102,7 @@ export default function FloatingAnnotations(props: Props) {
       node: (
         <CommentFloat
           thread={t}
+          active={props.activeIds.includes(t.id)}
           expanded={expanded === `c-${t.id}`}
           onToggle={() => {
             setExpanded((e) => (e === `c-${t.id}` ? null : `c-${t.id}`));
@@ -120,6 +125,7 @@ export default function FloatingAnnotations(props: Props) {
         node: (
           <SuggestionFloat
             s={s}
+            active={props.activeIds.includes(s.id)}
             expanded={expanded === `s-${s.id}`}
             onToggle={() =>
               setExpanded((e) => (e === `s-${s.id}` ? null : `s-${s.id}`))
@@ -259,11 +265,13 @@ function SuggestComposer(props: Props) {
 
 function CommentFloat({
   thread,
+  active,
   expanded,
   onToggle,
   ...props
 }: Props & {
   thread: CommentThreadData;
+  active: boolean;
   expanded: boolean;
   onToggle: () => void;
 }) {
@@ -273,7 +281,7 @@ function CommentFloat({
   if (!expanded) {
     return (
       <div
-        className={`card float-card collapsed ${thread.resolved ? 'resolved' : ''}`}
+        className={`card float-card collapsed ${thread.resolved ? 'resolved' : ''} ${active ? 'active' : ''}`}
         onClick={onToggle}
       >
         <div className="card-head">
@@ -290,7 +298,9 @@ function CommentFloat({
   }
 
   return (
-    <div className={`card float-card ${thread.resolved ? 'resolved' : ''}`}>
+    <div
+      className={`card float-card ${thread.resolved ? 'resolved' : ''} ${active ? 'active' : ''}`}
+    >
       <div className="card-head">
         <Avatar name={first?.author ?? '?'} />
         <span className="author">{first?.author}</span>
@@ -352,12 +362,22 @@ function CommentFloat({
 
 function SuggestionFloat({
   s,
+  active,
   expanded,
   onToggle,
   ...props
-}: Props & { s: SuggestionData; expanded: boolean; onToggle: () => void }) {
+}: Props & {
+  s: SuggestionData;
+  active: boolean;
+  expanded: boolean;
+  onToggle: () => void;
+}) {
+  const [reply, setReply] = useState('');
   return (
-    <div className="card float-card suggestion" onClick={!expanded ? onToggle : undefined}>
+    <div
+      className={`card float-card suggestion ${active ? 'active' : ''}`}
+      onClick={!expanded ? onToggle : undefined}
+    >
       <div className="card-head">
         <Avatar name={s.author} />
         <span className="author">{s.author}</span>
@@ -374,6 +394,38 @@ function SuggestionFloat({
       ) : (
         <div className="collapsed-text mono">
           {(s.original || '∅').slice(0, 40)} → {(s.proposed || '∅').slice(0, 40)}
+        </div>
+      )}
+      {expanded && s.replies.length > 0 &&
+        s.replies.map((r) => (
+          <div className="reply" key={r.id}>
+            <Avatar name={r.author} />
+            <div>
+              <div className="reply-meta">
+                <span className="author">{r.author}</span>{' '}
+                <span className="when">{timeAgo(r.createdAt)}</span>
+              </div>
+              <div className="reply-text">{r.text}</div>
+            </div>
+          </div>
+        ))}
+      {!expanded && s.replies.length > 0 && (
+        <div className="collapsed-text">{s.replies.length} repl{s.replies.length === 1 ? 'y' : 'ies'}</div>
+      )}
+      {expanded && props.canComment && (
+        <div className="reply-row">
+          <input
+            placeholder="Comment on this suggestion…"
+            value={reply}
+            onChange={(e) => setReply(e.target.value)}
+            onClick={(e) => e.stopPropagation()}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && reply.trim()) {
+                props.onSuggestionReply(s.id, reply.trim());
+                setReply('');
+              }
+            }}
+          />
         </div>
       )}
       {props.canModerate && (

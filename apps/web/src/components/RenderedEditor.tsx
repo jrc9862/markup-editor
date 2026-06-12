@@ -140,6 +140,7 @@ export default function RenderedEditor({
   focusRange = null,
   readOnly = false,
   onSelectionChange,
+  onCursorChange,
   onReady,
 }: {
   ytext: Y.Text;
@@ -153,6 +154,8 @@ export default function RenderedEditor({
   /** Below editor role: WYSIWYG editing is disabled. */
   readOnly?: boolean;
   onSelectionChange?: (sel: { from: number; to: number } | null) => void;
+  /** Cursor head as a markdown offset (drives floating-card highlighting). */
+  onCursorChange?: (offset: number | null) => void;
   onReady?: (handle: EditorHandle | null) => void;
 }) {
   // True while we are applying a remote change into the editor, so the
@@ -160,6 +163,8 @@ export default function RenderedEditor({
   const applyingRemote = useRef(false);
   const onSelRef = useRef(onSelectionChange);
   onSelRef.current = onSelectionChange;
+  const onCursorRef = useRef(onCursorChange);
+  onCursorRef.current = onCursorChange;
   const onReadyRef = useRef(onReady);
   onReadyRef.current = onReady;
 
@@ -200,16 +205,15 @@ export default function RenderedEditor({
     const plain = doc.textBetween(0, doc.content.size, '\n');
     const plainAnchor = doc.textBetween(0, anchor, '\n').length;
     const plainHead = doc.textBetween(0, head, '\n').length;
+    const mdHead = mapOffsetThroughDiff(plain, md, plainHead, 'right');
     aw.setLocalStateField('cursor', {
       anchor: Y.createRelativePositionFromTypeIndex(
         ytext,
         mapOffsetThroughDiff(plain, md, plainAnchor, 'right'),
       ),
-      head: Y.createRelativePositionFromTypeIndex(
-        ytext,
-        mapOffsetThroughDiff(plain, md, plainHead, 'right'),
-      ),
+      head: Y.createRelativePositionFromTypeIndex(ytext, mdHead),
     });
+    onCursorRef.current?.(mdHead);
   };
 
   const editor = useEditor({
@@ -301,6 +305,11 @@ export default function RenderedEditor({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editor, ytext, JSON.stringify(commentRanges), JSON.stringify(suggestionRanges)]);
 
+  useEffect(() => {
+    editor?.setEditable(!readOnly);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editor, readOnly]);
+
   // --- remote cursors ---------------------------------------------------------
 
   useEffect(() => {
@@ -346,16 +355,17 @@ export default function RenderedEditor({
           decos.push(
             Decoration.inline(Math.min(pa, ph), Math.max(pa, ph), {
               class: 'pm-remote-selection',
-              style: `background-color: ${color}33`,
+              style: `background-color: ${color}40`,
+            }),
+          );
+        } else {
+          decos.push(
+            Decoration.widget(ph, () => remoteCaretDom(name, color), {
+              key: `${clientId}-${color}-${name}`,
+              side: 0,
             }),
           );
         }
-        decos.push(
-          Decoration.widget(ph, () => remoteCaretDom(name, color), {
-            key: `${clientId}-${color}-${name}`,
-            side: 0,
-          }),
-        );
       });
       editor.view.dispatch(
         editor.state.tr.setMeta(remoteCursorsKey, DecorationSet.create(doc, decos)),
@@ -371,6 +381,7 @@ export default function RenderedEditor({
       if (!editor.isDestroyed) editor.unregisterPlugin(remoteCursorsKey);
       // Stop broadcasting a stale caret once this view goes away.
       aw.setLocalStateField('cursor', null);
+      onCursorRef.current?.(null);
     };
   }, [editor, provider, ytext]);
 

@@ -12,6 +12,7 @@ export {
   setResolved,
   snapshotComments,
   addSuggestion,
+  addSuggestionReply,
   acceptSuggestion,
   rejectSuggestion,
   updateSuggestion,
