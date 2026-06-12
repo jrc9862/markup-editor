@@ -5,7 +5,7 @@
 FROM node:20 AS build
 WORKDIR /app
 
-COPY package.json package-lock.json ./
+COPY package.json package-lock.json tsconfig.base.json ./
 COPY packages/sync-core/package.json packages/sync-core/
 COPY apps/server/package.json apps/server/
 RUN npm ci --workspace @markup/sync-core --workspace @markup/server
