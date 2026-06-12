@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import type { DocMeta } from '@markup/sync-core';
 import { SERVER_HTTP, authHeaders } from '@/lib/config';
+import UserMenu from '@/components/UserMenu';
 
 interface TreeDir {
   dirs: Map<string, TreeDir>;
@@ -84,7 +85,10 @@ export default function HomePage() {
 
   return (
     <main className="doc-list">
-      <h1>markup</h1>
+      <div className="doc-list-header">
+        <h1>markup</h1>
+        <UserMenu />
+      </div>
       <p style={{ color: 'var(--muted)' }}>
         Files appear here in the same directory structure as on disk. Open one
         from your terminal with <code>markup open path/to/file.md</code>.

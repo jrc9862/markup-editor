@@ -96,6 +96,11 @@ reach every connected human (and the CLI daemon → disk) in realtime:
 - `GET|POST /api/docs/:id/suggestions` · `POST .../suggestions/:sid/accept` ·
   `POST .../suggestions/:sid/reject`
 - `GET .../versions` · `GET .../versions/:vid` · `POST .../restore`
+- `GET /api/me` · `GET|POST /api/tokens` · `DELETE /api/tokens/:id`
+
+Agents should run on a scoped API token (`suggest` is the agent-native
+default: propose, never write); the route's required scope is enforced
+server-side.
 
 Range-taking routes accept `{from,to}` offsets **or** `{anchorText,
 occurrence?}` — quote the text you mean, the server finds it. Suggestion
@@ -134,8 +139,19 @@ To exercise a full end-to-end loop: start server + web, then
 two tabs; edits must converge in both tabs *and* the file on disk. The REST
 agent surface can be smoke-tested with curl + `Authorization: Bearer dev-token`.
 
-Auth is a single shared bearer token for now: `MARKUP_TOKEN` (default
-`dev-token`) on server and CLI, `NEXT_PUBLIC_MARKUP_TOKEN` on web. Other env:
+Auth (Phase 1, see PHASE1_IDENTITY.md): three principal kinds — session
+cookie (signed-in human; OIDC via `OIDC_ISSUER`/`OIDC_CLIENT_ID`/
+`OIDC_CLIENT_SECRET`, or zero-setup dev sign-in `POST /auth/dev` when OIDC is
+unset), `mkp_`-prefixed API tokens (per-user/per-agent, scoped
+read<comment<suggest<write, managed via `/api/tokens`, hashes only in DB —
+this is also CLI auth: set `MARKUP_TOKEN=mkp_...`), and the legacy shared
+`MARKUP_TOKEN` (default `dev-token`, full access until milestone 2 enforcement).
+Scope checks guard every REST route (`needs()` in `index.ts`); WS connections
+need write scope. Signed-in humans are stamped with real name + `authorId` on
+comments/suggestions; self-reported names are ignored. Web uses
+`NEXT_PUBLIC_MARKUP_TOKEN` as fallback plus the session cookie
+(`credentials: 'include'`; CORS locked to `MARKUP_WEB_ORIGIN`, default
+`http://localhost:3000`). Other env:
 `PORT`, `MARKUP_DATA_DIR`, `DATABASE_URL` (server — Postgres when set, SQLite
 otherwise); `MARKUP_SERVER`, `MARKUP_WEB` (CLI); `NEXT_PUBLIC_MARKUP_SERVER`
 (web). `NEXT_PUBLIC_*` values are inlined into the web bundle at **build
@@ -255,13 +271,13 @@ way), mono accents (CSS vars in `globals.css`).
 
 1. **Multi-edits** — batch find/replace and multi-range operations that apply
    as one undoable transaction.
-2. **Accounts & sharing permissions** — real user accounts (email/OAuth
-   sign-in, persistent identity replacing the localStorage guest name),
-   per-doc sharing: owner/editor/suggester/commenter/viewer roles, share
-   links with role baked in, workspace-level membership, and CLI auth via
-   per-user API tokens (replaces the single shared `MARKUP_TOKEN`).
-   Enforcement lives server-side: Hocuspocus `onAuthenticate` resolves
-   identity + role and read-only connections reject writes.
+2. **Accounts & sharing permissions** — milestone 1 shipped (OIDC/dev
+   sign-in, sessions, scoped per-user/agent API tokens, attribution; see
+   PHASE1_IDENTITY.md). Remaining: per-doc roles
+   (owner/editor/suggester/commenter/viewer), share links with role baked
+   in, workspace membership, role enforcement on Hocuspocus connections
+   (read-only for non-editors) and per-route, then retiring the legacy
+   shared `MARKUP_TOKEN`.
 3. **Git-native flows** — commit/branch from the UI, PR-style review of
    suggestion batches.
 4. **Conflict-free offline `sync`** — persist the CLI's Yjs state vector in
