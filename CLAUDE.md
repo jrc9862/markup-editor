@@ -64,7 +64,7 @@ normal edit.
 ## Layout
 
 ```
-apps/server/        Hocuspocus WS server + Express REST + SQLite persistence
+apps/server/        Hocuspocus WS server + Express REST + SQLite/Postgres persistence
 apps/web/           Next.js editor (source + rendered modes, presence)
 packages/sync-core/ applyStringToYText, shared types, presence helpers
 packages/cli/       `markup` CLI: open/sync/status + two-way disk daemon
@@ -72,8 +72,16 @@ packages/cli/       `markup` CLI: open/sync/status + two-way disk daemon
 
 - One document = one Yjs room; `docId` (uuid) is the room name and URL slug.
 - The CLI records `path -> docId` in a repo-local `.markup/manifest.json`.
-- Server persists Yjs updates in `markup-docs.sqlite` (Hocuspocus SQLite
-  extension) and doc metadata in `markup-meta.sqlite` (`apps/server/src/db.ts`).
+- Storage is selected by `DATABASE_URL`: when set, Postgres holds both Yjs
+  state (`documents` table via the Hocuspocus Database extension) and doc
+  metadata (`apps/server/src/db-postgres.ts`, ordered migrations under an
+  advisory lock). When unset (zero-setup local dev), SQLite: Yjs updates in
+  `markup-docs.sqlite` (Hocuspocus SQLite extension), metadata in
+  `markup-meta.sqlite` (`apps/server/src/db.ts`). Both meta stores implement
+  the async `MetaStore` interface in `db.ts`. `docker-compose.yml` provides a
+  local Postgres; CI runs the server tests against a Postgres service
+  container (the Postgres half of the suite skips when `DATABASE_URL` is
+  unset).
 
 ## Agent surface (REST)
 
@@ -124,8 +132,9 @@ agent surface can be smoke-tested with curl + `Authorization: Bearer dev-token`.
 
 Auth is a single shared bearer token for now: `MARKUP_TOKEN` (default
 `dev-token`) on server and CLI, `NEXT_PUBLIC_MARKUP_TOKEN` on web. Other env:
-`PORT`, `MARKUP_DATA_DIR` (server); `MARKUP_SERVER`, `MARKUP_WEB` (CLI);
-`NEXT_PUBLIC_MARKUP_SERVER` (web).
+`PORT`, `MARKUP_DATA_DIR`, `DATABASE_URL` (server — Postgres when set, SQLite
+otherwise); `MARKUP_SERVER`, `MARKUP_WEB` (CLI); `NEXT_PUBLIC_MARKUP_SERVER`
+(web).
 
 ## Gotchas (learned the hard way)
 
@@ -140,9 +149,11 @@ Auth is a single shared bearer token for now: `MARKUP_TOKEN` (default
   Creating the HocuspocusProvider in `useMemo` and destroying it in an effect
   cleanup breaks under React 18 StrictMode's dev double-mount: the remount
   re-attaches listeners to a destroyed provider and the doc never syncs.
-- **SQLite schema changes are additive migrations** in the `MetaStore`
-  constructor (`PRAGMA table_info` guard + `ALTER TABLE ADD COLUMN`) — local
-  databases persist across restarts, so never assume a fresh schema.
+- **Schema changes are additive migrations** — local/production databases
+  persist across restarts, so never assume a fresh schema. SQLite:
+  `SqliteMetaStore.init()` (`PRAGMA table_info` guard + `ALTER TABLE ADD
+  COLUMN`). Postgres: append a new entry to the `MIGRATIONS` array in
+  `db-postgres.ts`; never edit a shipped entry.
 - CI (GitHub Actions, `.github/workflows/ci.yml`) runs build, tests, and
   per-workspace `tsc --noEmit` on every push/PR to `main`.
 

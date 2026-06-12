@@ -1,5 +1,7 @@
 import { Server as Hocuspocus } from '@hocuspocus/server';
 import { SQLite } from '@hocuspocus/extension-sqlite';
+import { Database as DatabaseExtension } from '@hocuspocus/extension-database';
+import pg from 'pg';
 import express from 'express';
 import cors from 'cors';
 import { WebSocketServer } from 'ws';
@@ -18,20 +20,45 @@ import {
   snapshotSuggestions,
 } from '@markup/sync-core';
 import type { CreateDocRequest } from '@markup/sync-core';
-import { MetaStore } from './db.js';
+import { SqliteMetaStore, type MetaStore } from './db.js';
+import {
+  PostgresMetaStore,
+  fetchYjsState,
+  storeYjsState,
+} from './db-postgres.js';
 
 const PORT = Number(process.env.PORT ?? 4000);
 const TOKEN = process.env.MARKUP_TOKEN ?? 'dev-token';
 const DATA_DIR = process.env.MARKUP_DATA_DIR ?? '.';
+const DATABASE_URL = process.env.DATABASE_URL;
 
-const meta = new MetaStore(`${DATA_DIR}/markup-meta.sqlite`);
+// --- Data layer: Postgres when DATABASE_URL is set, SQLite otherwise --------
+//
+// SQLite is the zero-setup local-dev default; Postgres is the production
+// path (one pool shared by Yjs persistence and the meta store).
+
+const pool = DATABASE_URL
+  ? new pg.Pool({ connectionString: DATABASE_URL })
+  : null;
+
+const meta: MetaStore = pool
+  ? new PostgresMetaStore(pool)
+  : new SqliteMetaStore(`${DATA_DIR}/markup-meta.sqlite`);
+await meta.init();
+
+const persistence = pool
+  ? new DatabaseExtension({
+      fetch: ({ documentName }) => fetchYjsState(pool, documentName),
+      store: async ({ documentName, state }) => {
+        await storeYjsState(pool, documentName, state);
+      },
+    })
+  : new SQLite({ database: `${DATA_DIR}/markup-docs.sqlite` });
 
 // --- Hocuspocus: the Yjs sync engine + persistence -------------------------
 
 const hocuspocus = Hocuspocus.configure({
-  extensions: [
-    new SQLite({ database: `${DATA_DIR}/markup-docs.sqlite` }),
-  ],
+  extensions: [persistence],
 
   async onAuthenticate({ token }) {
     if (token !== TOKEN) {
@@ -40,11 +67,11 @@ const hocuspocus = Hocuspocus.configure({
   },
 
   async onStoreDocument({ documentName, document }) {
-    meta.touch(documentName);
+    await meta.touch(documentName);
     // Edit history: snapshot the markdown, debounced inside maybeAddVersion
     // so active typing doesn't create a version per save.
     const content = document.getText(CONTENT_FIELD).toString();
-    meta.maybeAddVersion(documentName, content);
+    await meta.maybeAddVersion(documentName, content);
   },
 });
 
@@ -77,7 +104,7 @@ app.post('/api/docs', async (req, res) => {
     return;
   }
   const docId = uuidv4();
-  const docMeta = meta.create(docId, body.name, body.path);
+  const docMeta = await meta.create(docId, body.name, body.path);
 
   if (body.content) {
     // Seed the Yjs doc through a direct (server-side) connection so the
@@ -93,12 +120,12 @@ app.post('/api/docs', async (req, res) => {
   res.status(201).json(docMeta);
 });
 
-app.get('/api/docs', (_req, res) => {
-  res.json(meta.list());
+app.get('/api/docs', async (_req, res) => {
+  res.json(await meta.list());
 });
 
-app.get('/api/docs/:docId', (req, res) => {
-  const docMeta = meta.get(req.params.docId);
+app.get('/api/docs/:docId', async (req, res) => {
+  const docMeta = await meta.get(req.params.docId);
   if (!docMeta) {
     res.status(404).json({ error: 'not found' });
     return;
@@ -108,7 +135,7 @@ app.get('/api/docs/:docId', (req, res) => {
 
 /** Snapshot: the document's current markdown as plain text. */
 app.get('/api/docs/:docId/snapshot', async (req, res) => {
-  const docMeta = meta.get(req.params.docId);
+  const docMeta = await meta.get(req.params.docId);
   if (!docMeta) {
     res.status(404).json({ error: 'not found' });
     return;
@@ -171,8 +198,8 @@ function resolveRange(
   return null;
 }
 
-const requireDoc: express.RequestHandler = (req, res, next) => {
-  if (!meta.get(req.params.docId)) {
+const requireDoc: express.RequestHandler = async (req, res, next) => {
+  if (!(await meta.get(req.params.docId))) {
     res.status(404).json({ error: 'not found' });
     return;
   }
@@ -300,16 +327,16 @@ app.post(
 
 // --- Edit history -------------------------------------------------------------
 
-app.get('/api/docs/:docId/versions', (req, res) => {
-  if (!meta.get(req.params.docId)) {
+app.get('/api/docs/:docId/versions', async (req, res) => {
+  if (!(await meta.get(req.params.docId))) {
     res.status(404).json({ error: 'not found' });
     return;
   }
-  res.json(meta.listVersions(req.params.docId));
+  res.json(await meta.listVersions(req.params.docId));
 });
 
-app.get('/api/docs/:docId/versions/:versionId', (req, res) => {
-  const content = meta.getVersionContent(
+app.get('/api/docs/:docId/versions/:versionId', async (req, res) => {
+  const content = await meta.getVersionContent(
     req.params.docId,
     Number(req.params.versionId),
   );
@@ -327,7 +354,7 @@ app.get('/api/docs/:docId/versions/:versionId', (req, res) => {
  */
 app.post('/api/docs/:docId/restore', async (req, res) => {
   const versionId = Number((req.body as { versionId?: number })?.versionId);
-  const content = meta.getVersionContent(req.params.docId, versionId);
+  const content = await meta.getVersionContent(req.params.docId, versionId);
   if (content === undefined) {
     res.status(404).json({ error: 'version not found' });
     return;
@@ -344,6 +371,7 @@ app.post('/api/docs/:docId/restore', async (req, res) => {
 
 const httpServer = app.listen(PORT, () => {
   console.log(`markup server listening on http://localhost:${PORT}`);
+  console.log(`  storage:        ${pool ? 'postgres' : `sqlite (${DATA_DIR})`}`);
   console.log(`  WS (Yjs sync):  ws://localhost:${PORT}`);
   console.log(`  REST:           http://localhost:${PORT}/api`);
 });
