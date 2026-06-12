@@ -1,0 +1,29 @@
+{
+  "name": "@markup/sync-core",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsc -p tsconfig.json --watch",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "diff-match-patch": "^1.0.5",
+    "yjs": "^13.6.18"
+  },
+  "devDependencies": {
+    "@types/diff-match-patch": "^1.0.36",
+    "typescript": "^5.5.4",
+    "vitest": "^2.0.5"
+  }
+}

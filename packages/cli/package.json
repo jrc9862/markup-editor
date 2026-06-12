@@ -1,0 +1,27 @@
+{
+  "name": "@markup/cli",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": {
+    "markup": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "@hocuspocus/provider": "^2.13.5",
+    "@markup/sync-core": "*",
+    "chokidar": "^3.6.0",
+    "commander": "^12.1.0",
+    "open": "^10.1.0",
+    "ws": "^8.18.0",
+    "yjs": "^13.6.18"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "@types/ws": "^8.5.12",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.4"
+  }
+}
