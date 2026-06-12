@@ -146,8 +146,17 @@ unset), `mkp_`-prefixed API tokens (per-user/per-agent, scoped
 read<comment<suggest<write, managed via `/api/tokens`, hashes only in DB —
 this is also CLI auth: set `MARKUP_TOKEN=mkp_...`), and the legacy shared
 `MARKUP_TOKEN` (default `dev-token`, full access until milestone 2 enforcement).
-Scope checks guard every REST route (`needs()` in `index.ts`); WS connections
-need write scope. Signed-in humans are stamped with real name + `authorId` on
+Scope checks guard every REST route (`needs()` in `index.ts`). Per-doc roles
+(milestone 2): docs carry `owner_id` + `link_role` and a `doc_acl` table maps
+user→role (owner/editor/suggester/commenter/viewer; 'none' link role =
+private). Effective capability = weaker of token scope and doc role
+(`docAccess()` per route); owners manage grants via
+`GET|POST /api/docs/:id/permissions`, `DELETE .../permissions/:userId`,
+`PUT .../permissions/link`. WS connections below write capability are
+read-only (Hocuspocus drops their updates); suggester/commenter act through
+REST. `MARKUP_REQUIRE_AUTH=1` disables the legacy shared token entirely.
+Legacy principals and pre-identity (unowned) docs behave as before: full
+access, open collaboration. Signed-in humans are stamped with real name + `authorId` on
 comments/suggestions; self-reported names are ignored. Web uses
 `NEXT_PUBLIC_MARKUP_TOKEN` as fallback plus the session cookie
 (`credentials: 'include'`; CORS locked to `MARKUP_WEB_ORIGIN`, default
@@ -271,13 +280,12 @@ way), mono accents (CSS vars in `globals.css`).
 
 1. **Multi-edits** — batch find/replace and multi-range operations that apply
    as one undoable transaction.
-2. **Accounts & sharing permissions** — milestone 1 shipped (OIDC/dev
-   sign-in, sessions, scoped per-user/agent API tokens, attribution; see
-   PHASE1_IDENTITY.md). Remaining: per-doc roles
-   (owner/editor/suggester/commenter/viewer), share links with role baked
-   in, workspace membership, role enforcement on Hocuspocus connections
-   (read-only for non-editors) and per-route, then retiring the legacy
-   shared `MARKUP_TOKEN`.
+2. **Accounts & sharing permissions** — milestones 1+2 shipped (OIDC/dev
+   sign-in, sessions, scoped tokens, attribution, per-doc roles + ACL with
+   server-side REST/WS enforcement, MARKUP_REQUIRE_AUTH; see
+   PHASE1_IDENTITY.md). Remaining: sharing UI in the web app, role-aware
+   editor (read-only mode + REST-backed comment/suggest for restricted
+   roles), workspace membership.
 3. **Git-native flows** — commit/branch from the UI, PR-style review of
    suggestion batches.
 4. **Conflict-free offline `sync`** — persist the CLI's Yjs state vector in

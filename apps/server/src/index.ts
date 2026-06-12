@@ -19,9 +19,16 @@ import {
   rejectSuggestion,
   snapshotSuggestions,
 } from '@markup/sync-core';
-import type { CreateDocRequest, TokenScope } from '@markup/sync-core';
+import type { CreateDocRequest, DocMeta, TokenScope } from '@markup/sync-core';
 import { SqliteMetaStore, type MetaStore } from './db.js';
-import { resolvePrincipal, scopeAllows, type Principal } from './auth.js';
+import {
+  effectiveScope,
+  isRole,
+  resolvePrincipal,
+  roleFor,
+  scopeAllows,
+  type Principal,
+} from './auth.js';
 import { registerAuthRoutes, registerTokenRoutes } from './auth-routes.js';
 import { oidcFromEnv } from './oidc.js';
 import {
@@ -35,6 +42,10 @@ const TOKEN = process.env.MARKUP_TOKEN ?? 'dev-token';
 const DATA_DIR = process.env.MARKUP_DATA_DIR ?? '.';
 const DATABASE_URL = process.env.DATABASE_URL;
 const WEB_ORIGIN = process.env.MARKUP_WEB_ORIGIN ?? 'http://localhost:3000';
+// When set, the legacy shared token stops working: every request must be a
+// session or an API token. The end state for enterprise deployments.
+const REQUIRE_AUTH = process.env.MARKUP_REQUIRE_AUTH === '1';
+const LEGACY_TOKEN = REQUIRE_AUTH ? undefined : TOKEN;
 const SERVER_ORIGIN =
   process.env.MARKUP_SERVER_ORIGIN ?? `http://localhost:${PORT}`;
 const OIDC = oidcFromEnv(SERVER_ORIGIN);
@@ -67,19 +78,26 @@ const persistence = pool
 const hocuspocus = Hocuspocus.configure({
   extensions: [persistence],
 
-  async onAuthenticate({ token, requestHeaders }) {
+  async onAuthenticate({ token, requestHeaders, documentName, connection }) {
     // Session cookie (browser upgrade requests carry it), API token, or the
     // legacy shared token via the provider's token param.
     const principal = await resolvePrincipal(meta, {
       bearer: token,
       cookieHeader: requestHeaders.cookie,
-      legacyToken: TOKEN,
+      legacyToken: LEGACY_TOKEN,
     });
-    // Live Yjs connections can mutate content, so they need write scope;
-    // scoped agent tokens act through REST instead.
-    if (!principal || !scopeAllows(principal.scope, 'write')) {
-      throw new Error('invalid token');
-    }
+    if (!principal) throw new Error('invalid token');
+
+    const doc = await meta.get(documentName);
+    const scope = doc
+      ? await effectiveScope(meta, principal, doc)
+      : // No metadata (doc not registered yet): write-capable tokens only.
+        (scopeAllows(principal.scope, 'write') ? 'write' : null);
+    if (scope === null) throw new Error('no access');
+    // Below write capability the connection is read-only: Hocuspocus drops
+    // incoming doc updates server-side. Suggester/commenter roles act
+    // through the REST surface instead.
+    if (!scopeAllows(scope, 'write')) connection.readOnly = true;
   },
 
   async onStoreDocument({ documentName, document }) {
@@ -117,7 +135,7 @@ app.use('/api', async (req, res, next) => {
   const principal = await resolvePrincipal(meta, {
     bearer,
     cookieHeader: req.headers.cookie,
-    legacyToken: TOKEN,
+    legacyToken: LEGACY_TOKEN,
   });
   if (!principal) {
     res.status(401).json({ error: 'invalid token' });
@@ -156,6 +174,29 @@ function authorOf(
   return bodyAuthor ? { author: bodyAuthor } : null;
 }
 
+/**
+ * Doc-level gate: 404 unless the doc exists, 403 unless the principal's
+ * effective capability (weaker of token scope and doc role) covers `scope`.
+ * Stashes the doc meta in res.locals for the handler.
+ */
+const docAccess =
+  (scope: TokenScope): express.RequestHandler =>
+  async (req, res, next) => {
+    const doc = await meta.get(req.params.docId);
+    if (!doc) {
+      res.status(404).json({ error: 'not found' });
+      return;
+    }
+    const p = res.locals.principal as Principal;
+    const effective = await effectiveScope(meta, p, doc);
+    if (effective === null || !scopeAllows(effective, scope)) {
+      res.status(403).json({ error: `requires ${scope} access to this doc` });
+      return;
+    }
+    res.locals.docMeta = doc;
+    next();
+  };
+
 registerTokenRoutes(app, meta);
 
 /** Create a document, optionally seeding it with initial markdown. */
@@ -166,7 +207,13 @@ app.post('/api/docs', needs('write'), async (req, res) => {
     return;
   }
   const docId = uuidv4();
-  const docMeta = await meta.create(docId, body.name, body.path);
+  const p = res.locals.principal as Principal;
+  const docMeta = await meta.create(
+    docId,
+    body.name,
+    body.path,
+    p.kind === 'legacy' ? undefined : p.user.id,
+  );
 
   if (body.content) {
     // Seed the Yjs doc through a direct (server-side) connection so the
@@ -183,25 +230,23 @@ app.post('/api/docs', needs('write'), async (req, res) => {
 });
 
 app.get('/api/docs', needs('read'), async (_req, res) => {
-  res.json(await meta.list());
+  const p = res.locals.principal as Principal;
+  const all = await meta.list();
+  const visible: typeof all = [];
+  for (const doc of all) {
+    if ((await effectiveScope(meta, p, doc)) !== null) visible.push(doc);
+  }
+  res.json(visible);
 });
 
-app.get('/api/docs/:docId', needs('read'), async (req, res) => {
-  const docMeta = await meta.get(req.params.docId);
-  if (!docMeta) {
-    res.status(404).json({ error: 'not found' });
-    return;
-  }
-  res.json(docMeta);
+app.get('/api/docs/:docId', needs('read'), docAccess('read'), async (_req, res) => {
+  const docMeta = res.locals.docMeta as DocMeta;
+  const p = res.locals.principal as Principal;
+  res.json({ ...docMeta, myRole: await roleFor(meta, p, docMeta) });
 });
 
 /** Snapshot: the document's current markdown as plain text. */
-app.get('/api/docs/:docId/snapshot', needs('read'), async (req, res) => {
-  const docMeta = await meta.get(req.params.docId);
-  if (!docMeta) {
-    res.status(404).json({ error: 'not found' });
-    return;
-  }
+app.get('/api/docs/:docId/snapshot', needs('read'), docAccess('read'), async (req, res) => {
   const conn = await hocuspocus.openDirectConnection(req.params.docId);
   let content = '';
   await conn.transact((doc) => {
@@ -260,16 +305,8 @@ function resolveRange(
   return null;
 }
 
-const requireDoc: express.RequestHandler = async (req, res, next) => {
-  if (!(await meta.get(req.params.docId))) {
-    res.status(404).json({ error: 'not found' });
-    return;
-  }
-  next();
-};
-
 /** Direct write: reconcile the whole document to the provided markdown. */
-app.put('/api/docs/:docId/content', needs('write'), requireDoc, async (req, res) => {
+app.put('/api/docs/:docId/content', needs('write'), docAccess('write'), async (req, res) => {
   const { content } = req.body as { content?: string };
   if (typeof content !== 'string') {
     res.status(400).json({ error: 'content (string) is required' });
@@ -281,11 +318,11 @@ app.put('/api/docs/:docId/content', needs('write'), requireDoc, async (req, res)
   res.json({ ok: true });
 });
 
-app.get('/api/docs/:docId/comments', needs('read'), requireDoc, async (req, res) => {
+app.get('/api/docs/:docId/comments', needs('read'), docAccess('read'), async (req, res) => {
   res.json(await withDoc(req.params.docId, (doc) => snapshotComments(doc)));
 });
 
-app.post('/api/docs/:docId/comments', needs('comment'), requireDoc, async (req, res) => {
+app.post('/api/docs/:docId/comments', needs('comment'), docAccess('comment'), async (req, res) => {
   const body = req.body as RangeBody & { author?: string; text?: string };
   const who = authorOf(res, body.author);
   if (!who || !body.text) {
@@ -308,7 +345,7 @@ app.post('/api/docs/:docId/comments', needs('comment'), requireDoc, async (req, 
 app.post(
   '/api/docs/:docId/comments/:threadId/replies',
   needs('comment'),
-  requireDoc,
+  docAccess('comment'),
   async (req, res) => {
     const { author, text } = req.body as { author?: string; text?: string };
     const who = authorOf(res, author);
@@ -326,7 +363,7 @@ app.post(
 app.post(
   '/api/docs/:docId/comments/:threadId/resolve',
   needs('comment'),
-  requireDoc,
+  docAccess('comment'),
   async (req, res) => {
     const resolved = (req.body as { resolved?: boolean }).resolved ?? true;
     await withDoc(req.params.docId, (doc) =>
@@ -336,11 +373,11 @@ app.post(
   },
 );
 
-app.get('/api/docs/:docId/suggestions', needs('read'), requireDoc, async (req, res) => {
+app.get('/api/docs/:docId/suggestions', needs('read'), docAccess('read'), async (req, res) => {
   res.json(await withDoc(req.params.docId, (doc) => snapshotSuggestions(doc)));
 });
 
-app.post('/api/docs/:docId/suggestions', needs('suggest'), requireDoc, async (req, res) => {
+app.post('/api/docs/:docId/suggestions', needs('suggest'), docAccess('suggest'), async (req, res) => {
   const body = req.body as RangeBody & { author?: string; proposed?: string };
   const who = authorOf(res, body.author);
   if (!who || typeof body.proposed !== 'string') {
@@ -369,7 +406,7 @@ app.post('/api/docs/:docId/suggestions', needs('suggest'), requireDoc, async (re
 app.post(
   '/api/docs/:docId/suggestions/:sid/accept',
   needs('write'),
-  requireDoc,
+  docAccess('write'),
   async (req, res) => {
     const ok = await withDoc(req.params.docId, (doc) =>
       acceptSuggestion(doc, doc.getText(CONTENT_FIELD), req.params.sid),
@@ -381,7 +418,7 @@ app.post(
 app.post(
   '/api/docs/:docId/suggestions/:sid/reject',
   needs('write'),
-  requireDoc,
+  docAccess('write'),
   async (req, res) => {
     await withDoc(req.params.docId, (doc) =>
       rejectSuggestion(doc, req.params.sid),
@@ -390,17 +427,88 @@ app.post(
   },
 );
 
-// --- Edit history -------------------------------------------------------------
+// --- Sharing / permissions (owner only) ---------------------------------------
 
-app.get('/api/docs/:docId/versions', needs('read'), async (req, res) => {
-  if (!(await meta.get(req.params.docId))) {
+const ownerOnly: express.RequestHandler = async (req, res, next) => {
+  const doc = await meta.get(req.params.docId);
+  if (!doc) {
     res.status(404).json({ error: 'not found' });
     return;
   }
+  const p = res.locals.principal as Principal;
+  if ((await roleFor(meta, p, doc)) !== 'owner') {
+    res.status(403).json({ error: 'only the owner can manage permissions' });
+    return;
+  }
+  res.locals.docMeta = doc;
+  next();
+};
+
+app.get('/api/docs/:docId/permissions', ownerOnly, async (req, res) => {
+  const doc = res.locals.docMeta as DocMeta;
+  res.json({
+    ownerId: doc.ownerId,
+    owner: doc.ownerId ? await meta.getUser(doc.ownerId) : undefined,
+    linkRole: doc.linkRole ?? 'editor',
+    entries: await meta.listAcl(req.params.docId),
+  });
+});
+
+/** Grant a role to a user by email or id. */
+app.post('/api/docs/:docId/permissions', ownerOnly, async (req, res) => {
+  const body = req.body as { email?: string; userId?: string; role?: string };
+  if (!isRole(body.role)) {
+    res.status(400).json({
+      error: 'role must be editor|suggester|commenter|viewer',
+    });
+    return;
+  }
+  const user = body.userId
+    ? await meta.getUser(body.userId)
+    : body.email
+      ? await meta.getUserByEmail(body.email)
+      : undefined;
+  if (!user) {
+    res.status(404).json({ error: 'no such user' });
+    return;
+  }
+  await meta.setAclRole(req.params.docId, user.id, body.role);
+  res.json({ userId: user.id, role: body.role });
+});
+
+app.delete(
+  '/api/docs/:docId/permissions/:userId',
+  ownerOnly,
+  async (req, res) => {
+    const ok = await meta.removeAclRole(req.params.docId, req.params.userId);
+    if (!ok) {
+      res.status(404).json({ error: 'not found' });
+      return;
+    }
+    res.json({ ok: true });
+  },
+);
+
+/** Set the role granted by the share link ('none' makes the doc private). */
+app.put('/api/docs/:docId/permissions/link', ownerOnly, async (req, res) => {
+  const role = (req.body as { role?: string }).role;
+  if (role !== 'none' && !isRole(role)) {
+    res.status(400).json({
+      error: 'role must be editor|suggester|commenter|viewer|none',
+    });
+    return;
+  }
+  await meta.setLinkRole(req.params.docId, role as never);
+  res.json({ ok: true });
+});
+
+// --- Edit history -------------------------------------------------------------
+
+app.get('/api/docs/:docId/versions', needs('read'), docAccess('read'), async (req, res) => {
   res.json(await meta.listVersions(req.params.docId));
 });
 
-app.get('/api/docs/:docId/versions/:versionId', needs('read'), async (req, res) => {
+app.get('/api/docs/:docId/versions/:versionId', needs('read'), docAccess('read'), async (req, res) => {
   const content = await meta.getVersionContent(
     req.params.docId,
     Number(req.params.versionId),
@@ -417,7 +525,7 @@ app.get('/api/docs/:docId/versions/:versionId', needs('read'), async (req, res) 
  * minimal diff, so it flows to every connected client (and the CLI) like a
  * normal edit — and is itself undoable via history.
  */
-app.post('/api/docs/:docId/restore', needs('write'), async (req, res) => {
+app.post('/api/docs/:docId/restore', needs('write'), docAccess('write'), async (req, res) => {
   const versionId = Number((req.body as { versionId?: number })?.versionId);
   const content = await meta.getVersionContent(req.params.docId, versionId);
   if (content === undefined) {

@@ -1,13 +1,16 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { SqliteMetaStore } from './db.js';
 import {
+  effectiveScope,
   newApiTokenSecret,
   resolvePrincipal,
+  roleFor,
   scopeAllows,
   sessionCookie,
   sha256,
   startSession,
   SESSION_COOKIE,
+  type Principal,
 } from './auth.js';
 
 describe('scopes', () => {
@@ -105,5 +108,64 @@ describe('resolvePrincipal', () => {
       `${SESSION_COOKIE}=abc; HttpOnly; Path=/; Max-Age=2592000; SameSite=Lax`,
     );
     expect(sessionCookie('abc', { secure: true })).toContain('; Secure');
+  });
+});
+
+describe('roles', () => {
+  const store = new SqliteMetaStore(':memory:');
+  const asUser = (id: string, name = id): Principal => ({
+    kind: 'user',
+    user: { id, email: `${id}@x.com`, name, createdAt: '' },
+    scope: 'write',
+  });
+  const legacy: Principal = { kind: 'legacy', scope: 'write' };
+
+  beforeAll(async () => {
+    await store.init();
+    await store.upsertUser('owner', 'owner@x.com', 'Owner');
+    await store.upsertUser('peer', 'peer@x.com', 'Peer');
+  });
+
+  afterAll(async () => {
+    await store.close();
+  });
+
+  it('resolves owner > acl > link role, defaulting open', async () => {
+    const doc = await store.create('d1', 'a.md', undefined, 'owner');
+    expect(await roleFor(store, asUser('owner'), doc)).toBe('owner');
+    // no ACL entry, no explicit link role: open collaboration
+    expect(await roleFor(store, asUser('peer'), doc)).toBe('editor');
+
+    await store.setAclRole('d1', 'peer', 'commenter');
+    const doc2 = (await store.get('d1'))!;
+    expect(await roleFor(store, asUser('peer'), doc2)).toBe('commenter');
+
+    await store.setLinkRole('d1', 'none');
+    const doc3 = (await store.get('d1'))!;
+    // ACL entry still wins over a private link role
+    expect(await roleFor(store, asUser('peer'), doc3)).toBe('commenter');
+    expect(await roleFor(store, asUser('stranger'), doc3)).toBe('none');
+    // legacy shared token bypasses roles until MARKUP_REQUIRE_AUTH
+    expect(await roleFor(store, legacy, doc3)).toBe('owner');
+  });
+
+  it('unowned (pre-identity) docs stay open', async () => {
+    const doc = await store.create('d2', 'b.md');
+    expect(await roleFor(store, asUser('anyone'), doc)).toBe('editor');
+  });
+
+  it('effective capability is the weaker of token scope and role', async () => {
+    const doc = (await store.get('d1'))!; // peer is commenter via ACL
+    expect(await effectiveScope(store, asUser('peer'), doc)).toBe('comment');
+
+    const agentSuggest: Principal = {
+      kind: 'agent',
+      user: { id: 'owner', email: 'owner@x.com', name: 'Owner', createdAt: '' },
+      tokenName: 'bot',
+      scope: 'suggest',
+    };
+    // owner role allows write, but the token only carries suggest
+    expect(await effectiveScope(store, agentSuggest, doc)).toBe('suggest');
+    expect(await effectiveScope(store, asUser('stranger'), doc)).toBeNull();
   });
 });

@@ -1,5 +1,11 @@
 import { createHash, randomBytes } from 'node:crypto';
-import type { AuthUser, MeResponse, TokenScope } from '@markup/sync-core';
+import type {
+  AuthUser,
+  DocMeta,
+  DocRole,
+  MeResponse,
+  TokenScope,
+} from '@markup/sync-core';
 import type { MetaStore } from './db.js';
 
 /** Ordered scopes: each implies the ones before it. */
@@ -99,6 +105,75 @@ export async function resolvePrincipal(
   }
 
   return null;
+}
+
+// --- Per-doc roles (milestone 2) ----------------------------------------------
+
+export const ROLES: Array<DocRole | 'none'> = [
+  'owner',
+  'editor',
+  'suggester',
+  'commenter',
+  'viewer',
+  'none',
+];
+
+export function isRole(r: unknown): r is DocRole {
+  return ROLES.includes(r as DocRole) && r !== 'owner' && r !== 'none';
+}
+
+/** The maximum capability a doc role grants (null = no access). */
+export function roleScope(role: DocRole | 'none'): TokenScope | null {
+  switch (role) {
+    case 'owner':
+    case 'editor':
+      return 'write';
+    case 'suggester':
+      return 'suggest';
+    case 'commenter':
+      return 'comment';
+    case 'viewer':
+      return 'read';
+    case 'none':
+      return null;
+  }
+}
+
+/**
+ * Resolve a principal's role on a doc: legacy principals act as owner (until
+ * MARKUP_REQUIRE_AUTH retires them); the creator is owner; explicit ACL
+ * entries next; otherwise the doc's link role (default editor — open
+ * collaboration). Docs from before identity existed have no owner and stay
+ * open.
+ */
+export async function roleFor(
+  meta: MetaStore,
+  principal: Principal,
+  doc: DocMeta,
+): Promise<DocRole | 'none'> {
+  if (principal.kind === 'legacy') return 'owner';
+  const userId = principal.user.id;
+  if (doc.ownerId === userId) return 'owner';
+  const acl = await meta.getAclRole(doc.docId, userId);
+  if (acl) return acl;
+  if (!doc.ownerId) return 'editor';
+  return doc.linkRole ?? 'editor';
+}
+
+/**
+ * The effective capability of a principal on a doc: the weaker of its token
+ * scope and its doc role. Null = no access at all.
+ */
+export async function effectiveScope(
+  meta: MetaStore,
+  principal: Principal,
+  doc: DocMeta,
+): Promise<TokenScope | null> {
+  const rs = roleScope(await roleFor(meta, principal, doc));
+  if (rs === null) return null;
+  return SCOPES.indexOf(principal.scope) < SCOPES.indexOf(rs)
+    ? principal.scope
+    : rs;
 }
 
 /** Create a session for a user; returns the plaintext secret for the cookie. */

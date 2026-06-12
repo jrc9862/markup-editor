@@ -91,6 +91,26 @@ function metaStoreContract(makeStore: () => Promise<MetaStore>) {
     expect(await store.getApiTokenByHash('th-1')).toBeUndefined();
   });
 
+  it('manages per-doc ACL entries and the link role', async () => {
+    await store.create('doc-acl', 'shared.md', undefined, 'u-1');
+    expect((await store.get('doc-acl'))!.ownerId).toBe('u-1');
+
+    expect(await store.getAclRole('doc-acl', 'u-1')).toBeUndefined();
+    await store.setAclRole('doc-acl', 'u-9', 'viewer');
+    await store.setAclRole('doc-acl', 'u-9', 'suggester'); // upsert
+    expect(await store.getAclRole('doc-acl', 'u-9')).toBe('suggester');
+
+    const acl = await store.listAcl('doc-acl');
+    expect(acl).toHaveLength(1);
+    expect(acl[0]).toMatchObject({ userId: 'u-9', role: 'suggester' });
+
+    await store.setLinkRole('doc-acl', 'none');
+    expect((await store.get('doc-acl'))!.linkRole).toBe('none');
+
+    expect(await store.removeAclRole('doc-acl', 'u-9')).toBe(true);
+    expect(await store.removeAclRole('doc-acl', 'u-9')).toBe(false);
+  });
+
   it('debounces version snapshots', async () => {
     expect(await store.maybeAddVersion('doc-1', 'v1', 0)).toBe(true);
     // identical content → no new version, regardless of interval

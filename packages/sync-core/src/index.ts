@@ -35,4 +35,6 @@ export type {
   AuthUser,
   ApiTokenMeta,
   MeResponse,
+  DocRole,
+  AclEntry,
 } from './types.js';
