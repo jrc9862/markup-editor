@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useRef } from 'react';
-import type * as Y from 'yjs';
+import * as Y from 'yjs';
 import type { HocuspocusProvider } from '@hocuspocus/provider';
 import {
   EditorView,
@@ -17,7 +17,11 @@ import { markdown } from '@codemirror/lang-markdown';
 import { yCollab } from 'y-codemirror.next';
 import type { PresenceUser, SuggestionData } from '@markup/sync-core';
 import type { EditorHandle, FormatTarget } from './format';
-import { suggestModeFilter, type SuggestSession } from './suggestMode';
+import {
+  suggestModeFilter,
+  type SuggestSession,
+  type SuggestionStore,
+} from './suggestMode';
 
 export interface CommentRange {
   from: number;
@@ -60,35 +64,19 @@ interface InlineSuggestion {
   author: string;
 }
 
-interface SuggestionHandlers {
-  accept: (id: string) => void;
-  reject: (id: string) => void;
-  /** False below write capability: widgets render without ✓/✕ buttons. */
-  canModerate: boolean;
-}
-
-const setSuggestions = StateEffect.define<{
-  items: InlineSuggestion[];
-  handlers: SuggestionHandlers;
-}>();
+const setSuggestions = StateEffect.define<InlineSuggestion[]>();
 
 const suggestionDelMark = Decoration.mark({ class: 'cm-suggestion-del' });
 
-/** Inline "→ proposed  ✓ ✕" widget rendered right after the targeted text. */
+/** Inline "→ proposed" widget after the targeted text (display only; the
+ * accept/reject controls live in the floating suggestion cards). */
 class SuggestionWidget extends WidgetType {
-  constructor(
-    readonly s: InlineSuggestion,
-    readonly handlers: SuggestionHandlers,
-  ) {
+  constructor(readonly s: InlineSuggestion) {
     super();
   }
 
   eq(other: SuggestionWidget): boolean {
-    return (
-      other.s.id === this.s.id &&
-      other.s.proposed === this.s.proposed &&
-      other.handlers.canModerate === this.handlers.canModerate
-    );
+    return other.s.id === this.s.id && other.s.proposed === this.s.proposed;
   }
 
   toDOM(): HTMLElement {
@@ -100,28 +88,6 @@ class SuggestionWidget extends WidgetType {
     proposed.className = 'cm-suggestion-proposed';
     proposed.textContent = this.s.proposed || '∅';
     wrap.appendChild(proposed);
-    if (!this.handlers.canModerate) return wrap;
-
-    const accept = document.createElement('button');
-    accept.className = 'cm-suggestion-btn accept';
-    accept.textContent = '✓';
-    accept.title = 'Accept suggestion';
-    accept.onmousedown = (e) => {
-      e.preventDefault();
-      this.handlers.accept(this.s.id);
-    };
-    wrap.appendChild(accept);
-
-    const reject = document.createElement('button');
-    reject.className = 'cm-suggestion-btn reject';
-    reject.textContent = '✕';
-    reject.title = 'Reject suggestion';
-    reject.onmousedown = (e) => {
-      e.preventDefault();
-      this.handlers.reject(this.s.id);
-    };
-    wrap.appendChild(reject);
-
     return wrap;
   }
 
@@ -138,7 +104,7 @@ const suggestionField = StateField.define<DecorationSet>({
       if (e.is(setSuggestions)) {
         const max = tr.newDoc.length;
         const ranges = [];
-        for (const s of e.value.items) {
+        for (const s of e.value) {
           if (s.from > max) continue;
           const to = Math.min(s.to, max);
           if (to > s.from) {
@@ -146,7 +112,7 @@ const suggestionField = StateField.define<DecorationSet>({
           }
           ranges.push(
             Decoration.widget({
-              widget: new SuggestionWidget(s, e.value.handlers),
+              widget: new SuggestionWidget(s),
               side: 1,
             }).range(to),
           );
@@ -162,6 +128,55 @@ const suggestionField = StateField.define<DecorationSet>({
   provide: (f) => EditorView.decorations.from(f),
 });
 
+// --- remote cursors -------------------------------------------------------------
+//
+// We render remote presence ourselves instead of y-codemirror's
+// yRemoteSelections so that a peer who is *selecting* shows only the
+// highlight — the blinking caret appears only for an empty selection.
+
+const setRemoteCursors = StateEffect.define<DecorationSet>();
+
+const remoteCursorField = StateField.define<DecorationSet>({
+  create: () => Decoration.none,
+  update(deco, tr) {
+    deco = deco.map(tr.changes);
+    for (const e of tr.effects) {
+      if (e.is(setRemoteCursors)) deco = e.value;
+    }
+    return deco;
+  },
+  provide: (f) => EditorView.decorations.from(f),
+});
+
+class RemoteCaretWidget extends WidgetType {
+  constructor(
+    readonly name: string,
+    readonly color: string,
+  ) {
+    super();
+  }
+
+  eq(other: RemoteCaretWidget): boolean {
+    return other.name === this.name && other.color === this.color;
+  }
+
+  toDOM(): HTMLElement {
+    const caret = document.createElement('span');
+    caret.className = 'cm-remote-caret';
+    caret.style.backgroundColor = this.color;
+    const label = document.createElement('span');
+    label.className = 'cm-remote-caret-label';
+    label.style.backgroundColor = this.color;
+    label.textContent = this.name;
+    caret.appendChild(label);
+    return caret;
+  }
+
+  ignoreEvent(): boolean {
+    return true;
+  }
+}
+
 // --- formatting (markdown text manipulation) -----------------------------------
 
 function makeFormat(view: EditorView): FormatTarget {
@@ -174,6 +189,7 @@ function makeFormat(view: EditorView): FormatTarget {
         anchor: from + left.length,
         head: from + left.length + sel.length,
       },
+      userEvent: 'input.format',
     });
     view.focus();
   };
@@ -192,7 +208,7 @@ function makeFormat(view: EditorView): FormatTarget {
         changes.push({ from: line.from, to: line.to, insert: next });
       }
     }
-    if (changes.length) view.dispatch({ changes });
+    if (changes.length) view.dispatch({ changes, userEvent: 'input.format' });
     view.focus();
   };
 
@@ -200,6 +216,7 @@ function makeFormat(view: EditorView): FormatTarget {
     const line = view.state.doc.lineAt(view.state.selection.main.to);
     view.dispatch({
       changes: { from: line.to, to: line.to, insert: `\n\n${block}\n` },
+      userEvent: 'input.format',
     });
     view.focus();
   };
@@ -223,6 +240,7 @@ function makeFormat(view: EditorView): FormatTarget {
           { from: first.from, to: first.from, insert: '```\n' },
           { from: last.to, to: last.to, insert: '\n```' },
         ],
+        userEvent: 'input.format',
       });
       view.focus();
     },
@@ -252,12 +270,11 @@ export default function SourceEditor({
   commentRanges,
   suggestions,
   suggesting,
+  suggestStore,
   readOnly,
-  canModerate,
-  onAccept,
-  onReject,
   focusRange,
   onSelectionChange,
+  onCursorChange,
   onReady,
 }: {
   ytext: Y.Text;
@@ -267,24 +284,26 @@ export default function SourceEditor({
   suggestions: SuggestionData[];
   /** Realtime suggestion mode: keystrokes become suggestions, not edits. */
   suggesting: boolean;
+  /** Where intercepted suggest-mode edits are recorded. */
+  suggestStore: SuggestionStore;
   /** Below editor role: the document text cannot be modified locally. */
   readOnly: boolean;
-  /** Whether this user may accept/reject suggestions (write capability). */
-  canModerate: boolean;
-  onAccept: (id: string) => void;
-  onReject: (id: string) => void;
   focusRange: { from: number; to: number; key: number } | null;
   onSelectionChange: (sel: { from: number; to: number } | null) => void;
+  /** Cursor head as a markdown offset (drives floating-card highlighting). */
+  onCursorChange?: (offset: number | null) => void;
   onReady: (handle: EditorHandle | null) => void;
 }) {
   const host = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
   const onSelRef = useRef(onSelectionChange);
   onSelRef.current = onSelectionChange;
-  const handlersRef = useRef({ accept: onAccept, reject: onReject, canModerate });
-  handlersRef.current = { accept: onAccept, reject: onReject, canModerate };
+  const onCursorRef = useRef(onCursorChange);
+  onCursorRef.current = onCursorChange;
   const suggestingRef = useRef(suggesting);
   suggestingRef.current = suggesting;
+  const storeRef = useRef(suggestStore);
+  storeRef.current = suggestStore;
   const sessionRef = useRef<SuggestSession | null>(null);
 
   // Leaving suggest mode ends the current coalescing run; the next keystroke
@@ -303,6 +322,62 @@ export default function SourceEditor({
       colorLight: `${user.color}33`,
     });
 
+    const awareness = provider.awareness;
+
+    // Render remote presence: a highlight while a peer is selecting, a
+    // terminal caret only when their selection is empty.
+    const renderRemoteCursors = () => {
+      const view = viewRef.current;
+      if (!view || !awareness) return;
+      const ydoc = ytext.doc!;
+      const max = view.state.doc.length;
+      const ranges = [];
+      for (const [clientId, state] of awareness.getStates()) {
+        if (clientId === awareness.clientID) continue;
+        const cur = state.cursor as
+          | { anchor: unknown; head: unknown }
+          | null
+          | undefined;
+        const u = state.user as { name?: string; color?: string } | undefined;
+        if (!cur?.anchor || !cur?.head) continue;
+        const a = Y.createAbsolutePositionFromRelativePosition(
+          Y.createRelativePositionFromJSON(cur.anchor),
+          ydoc,
+        );
+        const h = Y.createAbsolutePositionFromRelativePosition(
+          Y.createRelativePositionFromJSON(cur.head),
+          ydoc,
+        );
+        if (!a || !h) continue;
+        const from = Math.min(a.index, h.index, max);
+        const to = Math.min(Math.max(a.index, h.index), max);
+        const color = u?.color ?? '#888888';
+        if (from < to) {
+          ranges.push(
+            Decoration.mark({
+              class: 'cm-remote-selection',
+              attributes: { style: `background-color: ${color}40` },
+            }).range(from, to),
+          );
+        } else {
+          ranges.push(
+            Decoration.widget({
+              widget: new RemoteCaretWidget(u?.name ?? 'peer', color),
+              side: 0,
+            }).range(to),
+          );
+        }
+      }
+      view.dispatch({
+        effects: setRemoteCursors.of(
+          Decoration.set(
+            ranges.sort((x, y) => x.from - y.from || x.to - y.to),
+            true,
+          ),
+        ),
+      });
+    };
+
     const state = EditorState.create({
       doc: ytext.toString(),
       extensions: [
@@ -313,15 +388,17 @@ export default function SourceEditor({
         EditorView.lineWrapping,
         EditorState.readOnly.of(readOnly),
         EditorView.editable.of(!readOnly),
-        yCollab(ytext, provider.awareness),
+        // null awareness: we publish + render presence ourselves (below).
+        yCollab(ytext, null),
         suggestModeFilter({
           enabled: () => suggestingRef.current,
-          author: () => user.name,
-          ytext: () => ytext,
+          store: () => storeRef.current,
+          text: () => ytext.toString(),
           session: sessionRef,
         }),
         commentField,
         suggestionField,
+        remoteCursorField,
         EditorView.updateListener.of((u) => {
           if (u.selectionSet || u.docChanged) {
             const r = u.state.selection.main;
@@ -330,12 +407,25 @@ export default function SourceEditor({
                 ? null
                 : { from: Math.min(r.from, r.to), to: Math.max(r.from, r.to) },
             );
+            onCursorRef.current?.(r.head);
+            // Same awareness format as y-codemirror.next / rendered mode,
+            // so presence stays cross-mode.
+            awareness?.setLocalStateField('cursor', {
+              anchor: Y.createRelativePositionFromTypeIndex(ytext, r.anchor),
+              head: Y.createRelativePositionFromTypeIndex(ytext, r.head),
+            });
+          }
+          if (u.docChanged) {
+            // Relative positions may resolve differently after edits.
+            setTimeout(renderRemoteCursors, 0);
           }
         }),
       ],
     });
     const view = new EditorView({ state, parent: host.current });
     viewRef.current = view;
+    awareness?.on('change', renderRemoteCursors);
+    renderRemoteCursors();
 
     onReady({
       format: makeFormat(view),
@@ -350,9 +440,12 @@ export default function SourceEditor({
 
     return () => {
       onReady(null);
+      awareness?.off('change', renderRemoteCursors);
+      awareness?.setLocalStateField('cursor', null);
       viewRef.current = null;
       view.destroy();
       onSelRef.current(null);
+      onCursorRef.current?.(null);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ytext, provider, user, readOnly]);
@@ -374,18 +467,9 @@ export default function SourceEditor({
         proposed: s.proposed,
         author: s.author,
       }));
-    viewRef.current?.dispatch({
-      effects: setSuggestions.of({
-        items,
-        handlers: {
-          accept: (id) => handlersRef.current.accept(id),
-          reject: (id) => handlersRef.current.reject(id),
-          canModerate: handlersRef.current.canModerate,
-        },
-      }),
-    });
+    viewRef.current?.dispatch({ effects: setSuggestions.of(items) });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [JSON.stringify(suggestions), canModerate]);
+  }, [JSON.stringify(suggestions)]);
 
   // Scroll to a range when a floating card asks for it.
   useEffect(() => {

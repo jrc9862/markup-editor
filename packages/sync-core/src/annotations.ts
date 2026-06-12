@@ -75,6 +75,8 @@ export interface SuggestionData {
   proposed: string;
   status: SuggestionStatus;
   createdAt: string;
+  /** Discussion thread on the suggestion (same shape as comment replies). */
+  replies: CommentReplyData[];
 }
 
 function newId(): string {
@@ -161,6 +163,8 @@ export function addSuggestion(
   doc: Y.Doc,
   ytext: Y.Text,
   opts: {
+    /** Caller-supplied id (e.g. an optimistic client id echoed via REST). */
+    id?: string;
     from: number;
     to: number;
     author: string;
@@ -169,7 +173,7 @@ export function addSuggestion(
     proposed: string;
   },
 ): string {
-  const id = newId();
+  const id = opts.id ?? newId();
   const arr = doc.getArray<Y.Map<unknown>>(SUGGESTIONS_FIELD);
   doc.transact(() => {
     const s = new Y.Map<unknown>();
@@ -182,6 +186,7 @@ export function addSuggestion(
     s.set('proposed', opts.proposed);
     s.set('status', 'open' satisfies SuggestionStatus);
     s.set('createdAt', new Date().toISOString());
+    s.set('replies', new Y.Array<CommentReplyData>());
     arr.push([s]);
   });
   return id;
@@ -248,6 +253,32 @@ export function updateSuggestion(
   return true;
 }
 
+/** Comment on a suggestion (review discussion, like a PR thread). */
+export function addSuggestionReply(
+  doc: Y.Doc,
+  suggestionId: string,
+  opts: { author: string; authorId?: string; text: string },
+): boolean {
+  const s = findById(doc.getArray<Y.Map<unknown>>(SUGGESTIONS_FIELD), suggestionId);
+  if (!s) return false;
+  let replies = s.get('replies') as Y.Array<CommentReplyData> | undefined;
+  if (!replies) {
+    // Suggestions created before replies existed.
+    replies = new Y.Array<CommentReplyData>();
+    s.set('replies', replies);
+  }
+  replies.push([
+    {
+      id: newId(),
+      author: opts.author,
+      ...(opts.authorId ? { authorId: opts.authorId } : {}),
+      text: opts.text,
+      createdAt: new Date().toISOString(),
+    },
+  ]);
+  return true;
+}
+
 /** Delete a suggestion outright (used when a realtime suggestion is undone to a no-op). */
 export function removeSuggestion(doc: Y.Doc, suggestionId: string): void {
   const arr = doc.getArray<Y.Map<unknown>>(SUGGESTIONS_FIELD);
@@ -270,6 +301,9 @@ function toSuggestionData(doc: Y.Doc, s: Y.Map<unknown>): SuggestionData {
     proposed: s.get('proposed') as string,
     status: s.get('status') as SuggestionStatus,
     createdAt: s.get('createdAt') as string,
+    replies:
+      (s.get('replies') as Y.Array<CommentReplyData> | undefined)?.toArray() ??
+      [],
   };
 }
 

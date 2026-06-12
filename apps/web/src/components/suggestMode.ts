@@ -4,13 +4,7 @@ import {
   type Extension,
   type TransactionSpec,
 } from '@codemirror/state';
-import type * as Y from 'yjs';
-import {
-  addSuggestion,
-  getSuggestion,
-  updateSuggestion,
-  removeSuggestion,
-} from '@markup/sync-core';
+import type { SuggestionData } from '@markup/sync-core';
 
 /**
  * Realtime "Suggesting" mode (Google Docs style): while enabled, user edits
@@ -22,7 +16,9 @@ import {
  * Coalescing: a run of edits that keeps touching the same suggestion's range
  * folds into that one suggestion (one reviewable unit), tracked by a local
  * "session" (suggestion id + caret offset inside its proposed text). Moving
- * the cursor elsewhere starts a new suggestion.
+ * the cursor elsewhere starts a new suggestion. Multi-range transactions
+ * (toolbar formatting, e.g. wrapping a selection in **bold**) become one
+ * discrete suggestion covering the whole span.
  */
 
 export interface SuggestSession {
@@ -32,10 +28,28 @@ export interface SuggestSession {
   caret: number;
 }
 
+/**
+ * Where intercepted edits land. Editors write suggestion objects straight
+ * into the shared Y.Doc; the suggester role (whose WS connection is
+ * read-only) uses a REST-backed store with a local optimistic overlay.
+ */
+export interface SuggestionStore {
+  add(opts: {
+    from: number;
+    to: number;
+    original: string;
+    proposed: string;
+  }): string;
+  get(id: string): SuggestionData | null;
+  update(id: string, opts: { from: number; to: number; proposed: string }): void;
+  remove(id: string): void;
+}
+
 export interface SuggestModeOptions {
   enabled: () => boolean;
-  author: () => string;
-  ytext: () => Y.Text;
+  store: () => SuggestionStore;
+  /** Current document text (for `original` slices). */
+  text: () => string;
   session: { current: SuggestSession | null };
 }
 
@@ -51,15 +65,14 @@ interface Edit {
  * cursor should sit afterwards (document coordinates — the doc is unchanged).
  */
 export function recordSuggestionEdit(
-  ytext: Y.Text,
-  author: string,
+  store: SuggestionStore,
+  text: string,
   session: { current: SuggestSession | null },
   edit: Edit,
 ): number {
-  const doc = ytext.doc!;
   const { fromA, toA, insert, backward } = edit;
 
-  const active = session.current ? getSuggestion(doc, session.current.id) : null;
+  const active = session.current ? store.get(session.current.id) : null;
   const open =
     active && active.status === 'open' && active.from !== null && active.to !== null
       ? active
@@ -68,11 +81,10 @@ export function recordSuggestionEdit(
   const touches = open !== null && fromA <= open.to! && toA >= open.from!;
 
   if (!open || !touches) {
-    const id = addSuggestion(doc, ytext, {
+    const id = store.add({
       from: fromA,
       to: toA,
-      author,
-      original: ytext.toString().slice(fromA, toA),
+      original: text.slice(fromA, toA),
       proposed: insert,
     });
     session.current = { id, caret: insert.length };
@@ -89,7 +101,7 @@ export function recordSuggestionEdit(
     // Pure insertion at/inside the suggestion: splice into proposed text.
     proposed = proposed.slice(0, caret) + insert + proposed.slice(caret);
     sess.caret = caret + insert.length;
-    updateSuggestion(doc, ytext, open.id, { from, to, proposed });
+    store.update(open.id, { from, to, proposed });
     return fromA;
   }
 
@@ -100,17 +112,17 @@ export function recordSuggestionEdit(
       sess.caret = caret - 1;
       if (proposed === '' && from === to) {
         // The whole suggestion was typed and then un-typed: drop it.
-        removeSuggestion(doc, open.id);
+        store.remove(open.id);
         session.current = null;
         return toA;
       }
-      updateSuggestion(doc, ytext, open.id, { from, to, proposed });
+      store.update(open.id, { from, to, proposed });
       return toA;
     }
     if (!backward && caret < proposed.length) {
       // Delete-forward with proposed text after the caret: un-type it.
       proposed = proposed.slice(0, caret) + proposed.slice(caret + 1);
-      updateSuggestion(doc, ytext, open.id, { from, to, proposed });
+      store.update(open.id, { from, to, proposed });
       return fromA;
     }
   }
@@ -123,7 +135,7 @@ export function recordSuggestionEdit(
     proposed = proposed.slice(0, caret) + insert + proposed.slice(caret);
     sess.caret = caret + insert.length;
   }
-  updateSuggestion(doc, ytext, open.id, { from, to, proposed });
+  store.update(open.id, { from, to, proposed });
   return fromA;
 }
 
@@ -133,26 +145,45 @@ export function suggestModeFilter(opts: SuggestModeOptions): Extension {
     if (!opts.enabled() || !tr.docChanged) return tr;
     // Only intercept direct user edits; remote Yjs updates (applied by the
     // yCollab binding) and programmatic dispatches must pass through.
+    // Toolbar formatting dispatches with userEvent 'input.format'.
     if (!(tr.isUserEvent('input') || tr.isUserEvent('delete'))) return tr;
 
-    // Aggregate the change set (typing/deleting is a single change; treat
-    // multi-change transactions as one span for simplicity).
+    // Count the changes; collect the overall span.
     let fromA = -1;
     let toA = -1;
     let insert = '';
+    let count = 0;
     tr.changes.iterChanges((fA, tA, _fB, _tB, ins) => {
       if (fromA === -1) fromA = fA;
       toA = tA;
       insert += ins.toString();
+      count++;
     });
     if (fromA === -1) return tr;
 
-    const caret = recordSuggestionEdit(
-      opts.ytext(),
-      opts.author(),
-      opts.session,
-      { fromA, toA, insert, backward: tr.isUserEvent('delete.backward') },
-    );
+    const text = opts.text();
+
+    if (count > 1) {
+      // Multi-range transaction (formatting): one discrete suggestion whose
+      // proposed text is what the span would have become.
+      const fromB = tr.changes.mapPos(fromA, -1);
+      const toB = tr.changes.mapPos(toA, 1);
+      const id = opts.store().add({
+        from: fromA,
+        to: toA,
+        original: text.slice(fromA, toA),
+        proposed: tr.newDoc.sliceString(fromB, toB),
+      });
+      opts.session.current = { id, caret: 0 };
+      return { selection: EditorSelection.cursor(fromA), scrollIntoView: true };
+    }
+
+    const caret = recordSuggestionEdit(opts.store(), text, opts.session, {
+      fromA,
+      toA,
+      insert,
+      backward: tr.isUserEvent('delete.backward'),
+    });
 
     // Drop the doc change; just park the cursor (positions are in the
     // unchanged doc, since the edit never applied).
