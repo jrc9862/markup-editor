@@ -159,8 +159,10 @@ Auth is a single shared bearer token for now: `MARKUP_TOKEN` (default
 
 ## UI conventions (apps/web)
 
-Google-Docs layout with a developer edge: dark chrome topbar, gray canvas,
-white centered "page", mono accents (CSS vars in `globals.css`).
+Google-Docs layout with a terminal aesthetic: dark slate-grey theme
+throughout (darkest-slate chrome topbar, slate canvas, slightly lighter
+centered "page"), straight edges everywhere (no border-radius — keep it that
+way), mono accents (CSS vars in `globals.css`).
 
 - **Floating comments** (`FloatingAnnotations.tsx`): cards live in a margin
   gutter right of the page, vertically aligned with their anchored text and
