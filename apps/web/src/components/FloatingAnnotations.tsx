@@ -30,6 +30,9 @@ interface Props {
   onAccept: (id: string) => void;
   onReject: (id: string) => void;
   onJump: (r: Range) => void;
+  /** Capability gates from the resolved doc role. */
+  canComment: boolean;
+  canModerate: boolean;
   currentContent: () => string;
   /** Viewport Y of a markdown offset in the active editor. */
   measureTop: (mdOffset: number) => number | null;
@@ -292,16 +295,18 @@ function CommentFloat({
         <Avatar name={first?.author ?? '?'} />
         <span className="author">{first?.author}</span>
         <span className="when">{timeAgo(thread.createdAt)}</span>
-        <button
-          className="ghost-btn"
-          title={thread.resolved ? 'Re-open' : 'Resolve'}
-          onClick={(e) => {
-            e.stopPropagation();
-            props.onResolve(thread.id, !thread.resolved);
-          }}
-        >
-          {thread.resolved ? '↺' : '✓'}
-        </button>
+        {props.canComment && (
+          <button
+            className="ghost-btn"
+            title={thread.resolved ? 'Re-open' : 'Resolve'}
+            onClick={(e) => {
+              e.stopPropagation();
+              props.onResolve(thread.id, !thread.resolved);
+            }}
+          >
+            {thread.resolved ? '↺' : '✓'}
+          </button>
+        )}
         <button className="ghost-btn" onClick={onToggle}>−</button>
       </div>
       {thread.from !== null && thread.to !== null ? (
@@ -326,7 +331,7 @@ function CommentFloat({
           </div>
         </div>
       ))}
-      {!thread.resolved && (
+      {!thread.resolved && props.canComment && (
         <div className="reply-row">
           <input
             placeholder="Reply…"
@@ -371,26 +376,28 @@ function SuggestionFloat({
           {(s.original || '∅').slice(0, 40)} → {(s.proposed || '∅').slice(0, 40)}
         </div>
       )}
-      <div className="card-actions">
-        <button
-          className="primary-btn"
-          onClick={(e) => {
-            e.stopPropagation();
-            props.onAccept(s.id);
-          }}
-        >
-          Accept
-        </button>
-        <button
-          className="ghost-btn"
-          onClick={(e) => {
-            e.stopPropagation();
-            props.onReject(s.id);
-          }}
-        >
-          Reject
-        </button>
-      </div>
+      {props.canModerate && (
+        <div className="card-actions">
+          <button
+            className="primary-btn"
+            onClick={(e) => {
+              e.stopPropagation();
+              props.onAccept(s.id);
+            }}
+          >
+            Accept
+          </button>
+          <button
+            className="ghost-btn"
+            onClick={(e) => {
+              e.stopPropagation();
+              props.onReject(s.id);
+            }}
+          >
+            Reject
+          </button>
+        </div>
+      )}
     </div>
   );
 }

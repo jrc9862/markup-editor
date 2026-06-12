@@ -283,9 +283,9 @@ way), mono accents (CSS vars in `globals.css`).
 2. **Accounts & sharing permissions** — milestones 1+2 shipped (OIDC/dev
    sign-in, sessions, scoped tokens, attribution, per-doc roles + ACL with
    server-side REST/WS enforcement, MARKUP_REQUIRE_AUTH; see
-   PHASE1_IDENTITY.md). Remaining: sharing UI in the web app, role-aware
-   editor (read-only mode + REST-backed comment/suggest for restricted
-   roles), workspace membership.
+   PHASE1_IDENTITY.md), plus the role-aware web UI (Share popover, role
+   badge, read-only editor below editor role with REST-backed annotations).
+   Remaining: workspace membership, SAML/SCIM.
 3. **Git-native flows** — commit/branch from the UI, PR-style review of
    suggestion batches.
 4. **Conflict-free offline `sync`** — persist the CLI's Yjs state vector in

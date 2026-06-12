@@ -74,7 +74,10 @@ export default function HomePage() {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    fetch(`${SERVER_HTTP}/api/docs`, { headers: authHeaders() })
+    fetch(`${SERVER_HTTP}/api/docs`, {
+      headers: authHeaders(),
+      credentials: 'include',
+    })
       .then((r) => {
         if (!r.ok) throw new Error(`server returned ${r.status}`);
         return r.json();

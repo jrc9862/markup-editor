@@ -24,6 +24,7 @@ import type {
 import { SERVER_HTTP, SERVER_WS, TOKEN, authHeaders } from '@/lib/config';
 import { useMe } from '@/lib/auth';
 import UserMenu from './UserMenu';
+import SharePanel from './SharePanel';
 import SourceEditor from './SourceEditor';
 import RenderedEditor from './RenderedEditor';
 import Toolbar from './Toolbar';
@@ -69,6 +70,33 @@ export default function Editor({ docId }: { docId: string }) {
   const [conn, setConn] = useState<Conn | null>(null);
   const { me } = useMe();
   const signedIn = me?.kind === 'user';
+
+  // Capability from the doc role (myRole on GET /api/docs/:id). Until meta
+  // loads we assume editor — the server-side read-only WS connection is the
+  // real guard; this only drives the UI affordances.
+  const myRole = meta?.myRole ?? 'editor';
+  const cap =
+    { none: -1, viewer: 0, commenter: 1, suggester: 2, editor: 3, owner: 3 }[
+      myRole
+    ] ?? 3;
+  const canEdit = cap >= 3;
+  const canSuggest = cap >= 2;
+  const canComment = cap >= 1;
+
+  // Below write capability the WS connection is read-only, so local Y.Doc
+  // writes would silently not sync — annotation actions go through REST
+  // instead (the server applies them via a direct connection and they come
+  // back over the wire like any remote edit).
+  const restPost = useCallback(
+    (path: string, body: unknown) =>
+      fetch(`${SERVER_HTTP}/api/docs/${docId}${path}`, {
+        method: 'POST',
+        headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify(body),
+      }).catch(() => {}),
+    [docId],
+  );
 
   const [comments, setComments] = useState<CommentThreadData[]>([]);
   const [suggestions, setSuggestions] = useState<SuggestionData[]>([]);
@@ -168,7 +196,10 @@ export default function Editor({ docId }: { docId: string }) {
   }, [me, conn]);
 
   useEffect(() => {
-    fetch(`${SERVER_HTTP}/api/docs/${docId}`, { headers: authHeaders() })
+    fetch(`${SERVER_HTTP}/api/docs/${docId}`, {
+      headers: authHeaders(),
+      credentials: 'include',
+    })
       .then((r) => (r.ok ? r.json() : null))
       .then(setMeta)
       .catch(() => {});
@@ -203,24 +234,32 @@ export default function Editor({ docId }: { docId: string }) {
 
   const submitComment = (text: string) => {
     if (!conn || !selection) return;
-    addComment(conn.ydoc, conn.ytext, {
-      ...selection,
-      author: conn.user.name,
-      authorId: me?.kind === 'user' ? me.user!.id : undefined,
-      text,
-    });
+    if (!canEdit) {
+      void restPost('/comments', { ...selection, text });
+    } else {
+      addComment(conn.ydoc, conn.ytext, {
+        ...selection,
+        author: conn.user.name,
+        authorId: me?.kind === 'user' ? me.user!.id : undefined,
+        text,
+      });
+    }
     setComposer(null);
   };
 
   const submitSuggestion = (proposed: string) => {
     if (!conn || !selection) return;
-    addSuggestion(conn.ydoc, conn.ytext, {
-      ...selection,
-      author: conn.user.name,
-      authorId: me?.kind === 'user' ? me.user!.id : undefined,
-      original: snippet(selection),
-      proposed,
-    });
+    if (!canEdit) {
+      void restPost('/suggestions', { ...selection, proposed });
+    } else {
+      addSuggestion(conn.ydoc, conn.ytext, {
+        ...selection,
+        author: conn.user.name,
+        authorId: me?.kind === 'user' ? me.user!.id : undefined,
+        original: snippet(selection),
+        proposed,
+      });
+    }
     setComposer(null);
   };
 
@@ -294,18 +333,18 @@ export default function Editor({ docId }: { docId: string }) {
           ⏱ History
         </button>
 
-        <button className="primary-btn" onClick={copyLink}>
-          Copy link
-        </button>
+        {!canEdit && <span className="role-badge">{myRole}</span>}
+        <SharePanel docId={docId} isOwner={myRole === 'owner'} onCopyLink={copyLink} />
       </header>
 
       <Toolbar
         // Re-read the handle when an editor (re)registers it.
         key={handleVersion}
-        format={handleRef.current?.format ?? null}
-        canAnnotate={canAnnotate}
-        suggesting={mode === 'source' && suggesting}
-        suggestingAvailable={mode === 'source'}
+        format={canEdit ? (handleRef.current?.format ?? null) : null}
+        canAnnotate={canAnnotate && canComment}
+        canSuggestAction={canSuggest}
+        suggesting={mode === 'source' && suggesting && canEdit}
+        suggestingAvailable={mode === 'source' && canEdit}
         onSuggestingChange={setSuggesting}
         onComment={() => setComposer('comment')}
         onSuggest={() => setComposer('suggest')}
@@ -324,7 +363,9 @@ export default function Editor({ docId }: { docId: string }) {
                   user={conn.user}
                   commentRanges={commentRanges}
                   suggestions={suggestions}
-                  suggesting={suggesting}
+                  suggesting={suggesting && canEdit}
+                  readOnly={!canEdit}
+                  canModerate={canEdit}
                   onAccept={(id) =>
                     acceptSuggestion(conn.ydoc, conn.ytext, id)
                   }
@@ -345,6 +386,7 @@ export default function Editor({ docId }: { docId: string }) {
                     )
                     .map((s) => ({ from: s.from!, to: s.to! }))}
                   focusRange={focusRange}
+                  readOnly={!canEdit}
                   onSelectionChange={setSelection}
                   onReady={onEditorReady}
                 />
@@ -363,14 +405,24 @@ export default function Editor({ docId }: { docId: string }) {
                 onSubmitComment={submitComment}
                 onSubmitSuggestion={submitSuggestion}
                 onReply={(id, text) =>
-                  addReply(conn.ydoc, id, { author: conn.user.name, text })
+                  canEdit
+                    ? addReply(conn.ydoc, id, {
+                        author: conn.user.name,
+                        authorId: me?.kind === 'user' ? me.user!.id : undefined,
+                        text,
+                      })
+                    : void restPost(`/comments/${id}/replies`, { text })
                 }
                 onResolve={(id, resolved) =>
-                  setResolved(conn.ydoc, id, resolved)
+                  canEdit
+                    ? setResolved(conn.ydoc, id, resolved)
+                    : void restPost(`/comments/${id}/resolve`, { resolved })
                 }
                 onAccept={(id) => acceptSuggestion(conn.ydoc, conn.ytext, id)}
                 onReject={(id) => rejectSuggestion(conn.ydoc, id)}
                 onJump={jumpTo}
+                canComment={canComment}
+                canModerate={canEdit}
                 currentContent={() => conn.ytext.toString()}
                 measureTop={(off) =>
                   handleRef.current?.measurer.topOfOffset(off) ?? null

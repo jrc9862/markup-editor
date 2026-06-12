@@ -23,6 +23,7 @@ export default function HistoryPanel({
   const load = () => {
     fetch(`${SERVER_HTTP}/api/docs/${docId}/versions`, {
       headers: authHeaders(),
+      credentials: 'include',
     })
       .then((r) => r.json())
       .then(setVersions)
@@ -40,7 +41,7 @@ export default function HistoryPanel({
     }
     const r = await fetch(
       `${SERVER_HTTP}/api/docs/${docId}/versions/${id}`,
-      { headers: authHeaders() },
+      { headers: authHeaders(), credentials: 'include' },
     );
     const content = await r.text();
     setOpenId(id);
@@ -52,6 +53,7 @@ export default function HistoryPanel({
     await fetch(`${SERVER_HTTP}/api/docs/${docId}/restore`, {
       method: 'POST',
       headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+      credentials: 'include',
       body: JSON.stringify({ versionId: id }),
     });
     setOpenId(null);
