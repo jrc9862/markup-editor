@@ -382,3 +382,24 @@ httpServer.on('upgrade', (request, socket, head) => {
     hocuspocus.handleConnection(ws, request);
   });
 });
+
+// Graceful shutdown (docker stop / SIGTERM): hocuspocus.destroy() flushes
+// every loaded doc through onStoreDocument before we close the stores.
+let shuttingDown = false;
+async function shutdown(signal: string) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`${signal} received, flushing documents...`);
+  httpServer.close();
+  try {
+    await hocuspocus.destroy();
+    // meta.close() also ends the shared pg pool in the Postgres case.
+    await meta.close();
+  } catch (err) {
+    console.error('error during shutdown', err);
+    process.exit(1);
+  }
+  process.exit(0);
+}
+process.on('SIGTERM', () => void shutdown('SIGTERM'));
+process.on('SIGINT', () => void shutdown('SIGINT'));
