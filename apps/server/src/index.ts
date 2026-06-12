@@ -19,8 +19,11 @@ import {
   rejectSuggestion,
   snapshotSuggestions,
 } from '@markup/sync-core';
-import type { CreateDocRequest } from '@markup/sync-core';
+import type { CreateDocRequest, TokenScope } from '@markup/sync-core';
 import { SqliteMetaStore, type MetaStore } from './db.js';
+import { resolvePrincipal, scopeAllows, type Principal } from './auth.js';
+import { registerAuthRoutes, registerTokenRoutes } from './auth-routes.js';
+import { oidcFromEnv } from './oidc.js';
 import {
   PostgresMetaStore,
   fetchYjsState,
@@ -31,6 +34,10 @@ const PORT = Number(process.env.PORT ?? 4000);
 const TOKEN = process.env.MARKUP_TOKEN ?? 'dev-token';
 const DATA_DIR = process.env.MARKUP_DATA_DIR ?? '.';
 const DATABASE_URL = process.env.DATABASE_URL;
+const WEB_ORIGIN = process.env.MARKUP_WEB_ORIGIN ?? 'http://localhost:3000';
+const SERVER_ORIGIN =
+  process.env.MARKUP_SERVER_ORIGIN ?? `http://localhost:${PORT}`;
+const OIDC = oidcFromEnv(SERVER_ORIGIN);
 
 // --- Data layer: Postgres when DATABASE_URL is set, SQLite otherwise --------
 //
@@ -60,8 +67,17 @@ const persistence = pool
 const hocuspocus = Hocuspocus.configure({
   extensions: [persistence],
 
-  async onAuthenticate({ token }) {
-    if (token !== TOKEN) {
+  async onAuthenticate({ token, requestHeaders }) {
+    // Session cookie (browser upgrade requests carry it), API token, or the
+    // legacy shared token via the provider's token param.
+    const principal = await resolvePrincipal(meta, {
+      bearer: token,
+      cookieHeader: requestHeaders.cookie,
+      legacyToken: TOKEN,
+    });
+    // Live Yjs connections can mutate content, so they need write scope;
+    // scoped agent tokens act through REST instead.
+    if (!principal || !scopeAllows(principal.scope, 'write')) {
       throw new Error('invalid token');
     }
   },
@@ -78,26 +94,72 @@ const hocuspocus = Hocuspocus.configure({
 // --- REST API ---------------------------------------------------------------
 
 const app = express();
-app.use(cors());
+// Credentialed CORS for the web app; non-browser clients (CLI, agents via
+// curl) are unaffected by CORS.
+app.use(cors({ origin: WEB_ORIGIN, credentials: true }));
 app.use(express.json({ limit: '10mb' }));
-
-/** Bearer-token guard for all /api routes. */
-app.use('/api', (req, res, next) => {
-  const header = req.headers.authorization ?? '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : '';
-  if (token !== TOKEN) {
-    res.status(401).json({ error: 'invalid token' });
-    return;
-  }
-  next();
-});
 
 app.get('/healthz', (_req, res) => {
   res.json({ ok: true });
 });
 
+// Sign-in/out lives outside the /api guard.
+registerAuthRoutes(app, meta, {
+  oidc: OIDC,
+  webOrigin: WEB_ORIGIN,
+  secureCookies: SERVER_ORIGIN.startsWith('https'),
+});
+
+/** Auth guard for all /api routes: resolves the acting principal. */
+app.use('/api', async (req, res, next) => {
+  const header = req.headers.authorization ?? '';
+  const bearer = header.startsWith('Bearer ') ? header.slice(7) : undefined;
+  const principal = await resolvePrincipal(meta, {
+    bearer,
+    cookieHeader: req.headers.cookie,
+    legacyToken: TOKEN,
+  });
+  if (!principal) {
+    res.status(401).json({ error: 'invalid token' });
+    return;
+  }
+  res.locals.principal = principal;
+  next();
+});
+
+/** Per-route scope check (scopes are ordered; see auth.ts). */
+const needs =
+  (scope: TokenScope): express.RequestHandler =>
+  (_req, res, next) => {
+    const p = res.locals.principal as Principal;
+    if (!scopeAllows(p.scope, scope)) {
+      res.status(403).json({ error: `requires ${scope} scope` });
+      return;
+    }
+    next();
+  };
+
+/**
+ * Attribution: signed-in humans are stamped with their real identity
+ * (self-reported names ignored); agent tokens may label themselves but
+ * keep the owning user's id; the legacy token must self-report (as before).
+ */
+function authorOf(
+  res: express.Response,
+  bodyAuthor?: string,
+): { author: string; authorId?: string } | null {
+  const p = res.locals.principal as Principal;
+  if (p.kind === 'user') return { author: p.user.name, authorId: p.user.id };
+  if (p.kind === 'agent') {
+    return { author: bodyAuthor ?? p.tokenName, authorId: p.user.id };
+  }
+  return bodyAuthor ? { author: bodyAuthor } : null;
+}
+
+registerTokenRoutes(app, meta);
+
 /** Create a document, optionally seeding it with initial markdown. */
-app.post('/api/docs', async (req, res) => {
+app.post('/api/docs', needs('write'), async (req, res) => {
   const body = req.body as CreateDocRequest;
   if (!body?.name) {
     res.status(400).json({ error: 'name is required' });
@@ -120,11 +182,11 @@ app.post('/api/docs', async (req, res) => {
   res.status(201).json(docMeta);
 });
 
-app.get('/api/docs', async (_req, res) => {
+app.get('/api/docs', needs('read'), async (_req, res) => {
   res.json(await meta.list());
 });
 
-app.get('/api/docs/:docId', async (req, res) => {
+app.get('/api/docs/:docId', needs('read'), async (req, res) => {
   const docMeta = await meta.get(req.params.docId);
   if (!docMeta) {
     res.status(404).json({ error: 'not found' });
@@ -134,7 +196,7 @@ app.get('/api/docs/:docId', async (req, res) => {
 });
 
 /** Snapshot: the document's current markdown as plain text. */
-app.get('/api/docs/:docId/snapshot', async (req, res) => {
+app.get('/api/docs/:docId/snapshot', needs('read'), async (req, res) => {
   const docMeta = await meta.get(req.params.docId);
   if (!docMeta) {
     res.status(404).json({ error: 'not found' });
@@ -207,7 +269,7 @@ const requireDoc: express.RequestHandler = async (req, res, next) => {
 };
 
 /** Direct write: reconcile the whole document to the provided markdown. */
-app.put('/api/docs/:docId/content', requireDoc, async (req, res) => {
+app.put('/api/docs/:docId/content', needs('write'), requireDoc, async (req, res) => {
   const { content } = req.body as { content?: string };
   if (typeof content !== 'string') {
     res.status(400).json({ error: 'content (string) is required' });
@@ -219,13 +281,14 @@ app.put('/api/docs/:docId/content', requireDoc, async (req, res) => {
   res.json({ ok: true });
 });
 
-app.get('/api/docs/:docId/comments', requireDoc, async (req, res) => {
+app.get('/api/docs/:docId/comments', needs('read'), requireDoc, async (req, res) => {
   res.json(await withDoc(req.params.docId, (doc) => snapshotComments(doc)));
 });
 
-app.post('/api/docs/:docId/comments', requireDoc, async (req, res) => {
+app.post('/api/docs/:docId/comments', needs('comment'), requireDoc, async (req, res) => {
   const body = req.body as RangeBody & { author?: string; text?: string };
-  if (!body.author || !body.text) {
+  const who = authorOf(res, body.author);
+  if (!who || !body.text) {
     res.status(400).json({ error: 'author and text are required' });
     return;
   }
@@ -233,11 +296,7 @@ app.post('/api/docs/:docId/comments', requireDoc, async (req, res) => {
     const ytext = doc.getText(CONTENT_FIELD);
     const range = resolveRange(ytext.toString(), body);
     if (!range) return null;
-    return addComment(doc, ytext, {
-      ...range,
-      author: body.author!,
-      text: body.text!,
-    });
+    return addComment(doc, ytext, { ...range, ...who, text: body.text! });
   });
   if (!result) {
     res.status(400).json({ error: 'range not found (from/to or anchorText)' });
@@ -248,15 +307,17 @@ app.post('/api/docs/:docId/comments', requireDoc, async (req, res) => {
 
 app.post(
   '/api/docs/:docId/comments/:threadId/replies',
+  needs('comment'),
   requireDoc,
   async (req, res) => {
     const { author, text } = req.body as { author?: string; text?: string };
-    if (!author || !text) {
+    const who = authorOf(res, author);
+    if (!who || !text) {
       res.status(400).json({ error: 'author and text are required' });
       return;
     }
     await withDoc(req.params.docId, (doc) =>
-      addReply(doc, req.params.threadId, { author, text }),
+      addReply(doc, req.params.threadId, { ...who, text }),
     );
     res.json({ ok: true });
   },
@@ -264,6 +325,7 @@ app.post(
 
 app.post(
   '/api/docs/:docId/comments/:threadId/resolve',
+  needs('comment'),
   requireDoc,
   async (req, res) => {
     const resolved = (req.body as { resolved?: boolean }).resolved ?? true;
@@ -274,13 +336,14 @@ app.post(
   },
 );
 
-app.get('/api/docs/:docId/suggestions', requireDoc, async (req, res) => {
+app.get('/api/docs/:docId/suggestions', needs('read'), requireDoc, async (req, res) => {
   res.json(await withDoc(req.params.docId, (doc) => snapshotSuggestions(doc)));
 });
 
-app.post('/api/docs/:docId/suggestions', requireDoc, async (req, res) => {
+app.post('/api/docs/:docId/suggestions', needs('suggest'), requireDoc, async (req, res) => {
   const body = req.body as RangeBody & { author?: string; proposed?: string };
-  if (!body.author || typeof body.proposed !== 'string') {
+  const who = authorOf(res, body.author);
+  if (!who || typeof body.proposed !== 'string') {
     res.status(400).json({ error: 'author and proposed are required' });
     return;
   }
@@ -291,7 +354,7 @@ app.post('/api/docs/:docId/suggestions', requireDoc, async (req, res) => {
     if (!range) return null;
     return addSuggestion(doc, ytext, {
       ...range,
-      author: body.author!,
+      ...who,
       original: content.slice(range.from, range.to),
       proposed: body.proposed!,
     });
@@ -305,6 +368,7 @@ app.post('/api/docs/:docId/suggestions', requireDoc, async (req, res) => {
 
 app.post(
   '/api/docs/:docId/suggestions/:sid/accept',
+  needs('write'),
   requireDoc,
   async (req, res) => {
     const ok = await withDoc(req.params.docId, (doc) =>
@@ -316,6 +380,7 @@ app.post(
 
 app.post(
   '/api/docs/:docId/suggestions/:sid/reject',
+  needs('write'),
   requireDoc,
   async (req, res) => {
     await withDoc(req.params.docId, (doc) =>
@@ -327,7 +392,7 @@ app.post(
 
 // --- Edit history -------------------------------------------------------------
 
-app.get('/api/docs/:docId/versions', async (req, res) => {
+app.get('/api/docs/:docId/versions', needs('read'), async (req, res) => {
   if (!(await meta.get(req.params.docId))) {
     res.status(404).json({ error: 'not found' });
     return;
@@ -335,7 +400,7 @@ app.get('/api/docs/:docId/versions', async (req, res) => {
   res.json(await meta.listVersions(req.params.docId));
 });
 
-app.get('/api/docs/:docId/versions/:versionId', async (req, res) => {
+app.get('/api/docs/:docId/versions/:versionId', needs('read'), async (req, res) => {
   const content = await meta.getVersionContent(
     req.params.docId,
     Number(req.params.versionId),
@@ -352,7 +417,7 @@ app.get('/api/docs/:docId/versions/:versionId', async (req, res) => {
  * minimal diff, so it flows to every connected client (and the CLI) like a
  * normal edit — and is itself undoable via history.
  */
-app.post('/api/docs/:docId/restore', async (req, res) => {
+app.post('/api/docs/:docId/restore', needs('write'), async (req, res) => {
   const versionId = Number((req.body as { versionId?: number })?.versionId);
   const content = await meta.getVersionContent(req.params.docId, versionId);
   if (content === undefined) {

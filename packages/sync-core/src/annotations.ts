@@ -44,6 +44,8 @@ export function resolveAnchor(doc: Y.Doc, encoded: string): number | null {
 export interface CommentReplyData {
   id: string;
   author: string;
+  /** Stable user id when the author was an authenticated principal. */
+  authorId?: string;
   text: string;
   createdAt: string;
 }
@@ -65,6 +67,8 @@ export interface SuggestionData {
   from: number | null;
   to: number | null;
   author: string;
+  /** Stable user id when the author was an authenticated principal. */
+  authorId?: string;
   /** The text as it was when the suggestion was made. */
   original: string;
   /** The proposed replacement. */
@@ -82,7 +86,13 @@ function newId(): string {
 export function addComment(
   doc: Y.Doc,
   ytext: Y.Text,
-  opts: { from: number; to: number; author: string; text: string },
+  opts: {
+    from: number;
+    to: number;
+    author: string;
+    authorId?: string;
+    text: string;
+  },
 ): string {
   const id = newId();
   const threads = doc.getArray<Y.Map<unknown>>(COMMENTS_FIELD);
@@ -98,6 +108,7 @@ export function addComment(
       {
         id: newId(),
         author: opts.author,
+        ...(opts.authorId ? { authorId: opts.authorId } : {}),
         text: opts.text,
         createdAt: new Date().toISOString(),
       },
@@ -111,7 +122,7 @@ export function addComment(
 export function addReply(
   doc: Y.Doc,
   threadId: string,
-  opts: { author: string; text: string },
+  opts: { author: string; authorId?: string; text: string },
 ): void {
   const thread = findById(doc.getArray<Y.Map<unknown>>(COMMENTS_FIELD), threadId);
   if (!thread) return;
@@ -120,6 +131,7 @@ export function addReply(
     {
       id: newId(),
       author: opts.author,
+      ...(opts.authorId ? { authorId: opts.authorId } : {}),
       text: opts.text,
       createdAt: new Date().toISOString(),
     },
@@ -152,6 +164,7 @@ export function addSuggestion(
     from: number;
     to: number;
     author: string;
+    authorId?: string;
     original: string;
     proposed: string;
   },
@@ -164,6 +177,7 @@ export function addSuggestion(
     s.set('anchorStart', encodeAnchor(ytext, opts.from, 0));
     s.set('anchorEnd', encodeAnchor(ytext, opts.to, -1));
     s.set('author', opts.author);
+    if (opts.authorId) s.set('authorId', opts.authorId);
     s.set('original', opts.original);
     s.set('proposed', opts.proposed);
     s.set('status', 'open' satisfies SuggestionStatus);
@@ -251,6 +265,7 @@ function toSuggestionData(doc: Y.Doc, s: Y.Map<unknown>): SuggestionData {
     from: resolveAnchor(doc, s.get('anchorStart') as string),
     to: resolveAnchor(doc, s.get('anchorEnd') as string),
     author: s.get('author') as string,
+    authorId: (s.get('authorId') as string | undefined) ?? undefined,
     original: s.get('original') as string,
     proposed: s.get('proposed') as string,
     status: s.get('status') as SuggestionStatus,

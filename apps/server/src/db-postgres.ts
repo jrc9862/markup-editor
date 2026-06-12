@@ -1,6 +1,12 @@
 import pg from 'pg';
-import type { DocMeta, VersionMeta } from '@markup/sync-core';
-import type { MetaStore } from './db.js';
+import type {
+  ApiTokenMeta,
+  AuthUser,
+  DocMeta,
+  TokenScope,
+  VersionMeta,
+} from '@markup/sync-core';
+import type { ApiTokenRow, MetaStore, SessionRow } from './db.js';
 
 /**
  * Ordered, additive migrations — append only, never edit a shipped entry.
@@ -28,6 +34,28 @@ const MIGRATIONS: string[] = [
   `CREATE TABLE documents (
      name TEXT PRIMARY KEY,
      data BYTEA NOT NULL
+   )`,
+  // Phase 1 identity: users, sessions, per-user/agent API tokens.
+  `CREATE TABLE users (
+     id TEXT PRIMARY KEY,
+     email TEXT NOT NULL UNIQUE,
+     name TEXT NOT NULL,
+     created_at TEXT NOT NULL
+   )`,
+  `CREATE TABLE sessions (
+     token_hash TEXT PRIMARY KEY,
+     user_id TEXT NOT NULL,
+     created_at TEXT NOT NULL,
+     expires_at TEXT NOT NULL
+   )`,
+  `CREATE TABLE api_tokens (
+     id TEXT PRIMARY KEY,
+     user_id TEXT NOT NULL,
+     name TEXT NOT NULL,
+     scope TEXT NOT NULL,
+     token_hash TEXT NOT NULL UNIQUE,
+     created_at TEXT NOT NULL,
+     last_used_at TEXT
    )`,
 ];
 
@@ -196,6 +224,117 @@ export class PostgresMetaStore implements MetaStore {
       [docId, versionId],
     );
     return rows[0]?.content;
+  }
+
+  // --- Identity -------------------------------------------------------------
+
+  async upsertUser(id: string, email: string, name: string): Promise<AuthUser> {
+    const { rows } = await this.pool.query<{
+      id: string;
+      email: string;
+      name: string;
+      created_at: string;
+    }>(
+      `INSERT INTO users (id, email, name, created_at) VALUES ($1, $2, $3, $4)
+       ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name
+       RETURNING id, email, name, created_at`,
+      [id, email, name, new Date().toISOString()],
+    );
+    const r = rows[0];
+    return { id: r.id, email: r.email, name: r.name, createdAt: r.created_at };
+  }
+
+  async getUser(id: string): Promise<AuthUser | undefined> {
+    const { rows } = await this.pool.query<{
+      id: string;
+      email: string;
+      name: string;
+      created_at: string;
+    }>('SELECT id, email, name, created_at FROM users WHERE id = $1', [id]);
+    const r = rows[0];
+    return r
+      ? { id: r.id, email: r.email, name: r.name, createdAt: r.created_at }
+      : undefined;
+  }
+
+  async createSession(
+    tokenHash: string,
+    userId: string,
+    expiresAt: string,
+  ): Promise<void> {
+    await this.pool.query(
+      'INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES ($1, $2, $3, $4)',
+      [tokenHash, userId, new Date().toISOString(), expiresAt],
+    );
+  }
+
+  async getSession(tokenHash: string): Promise<SessionRow | undefined> {
+    const { rows } = await this.pool.query<{
+      user_id: string;
+      expires_at: string;
+    }>('SELECT user_id, expires_at FROM sessions WHERE token_hash = $1', [
+      tokenHash,
+    ]);
+    const r = rows[0];
+    return r ? { userId: r.user_id, expiresAt: r.expires_at } : undefined;
+  }
+
+  async deleteSession(tokenHash: string): Promise<void> {
+    await this.pool.query('DELETE FROM sessions WHERE token_hash = $1', [
+      tokenHash,
+    ]);
+  }
+
+  async createApiToken(t: ApiTokenRow & { tokenHash: string }): Promise<void> {
+    await this.pool.query(
+      'INSERT INTO api_tokens (id, user_id, name, scope, token_hash, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
+      [t.id, t.userId, t.name, t.scope, t.tokenHash, new Date().toISOString()],
+    );
+  }
+
+  async getApiTokenByHash(tokenHash: string): Promise<ApiTokenRow | undefined> {
+    const { rows } = await this.pool.query<{
+      id: string;
+      user_id: string;
+      name: string;
+      scope: TokenScope;
+    }>(
+      `UPDATE api_tokens SET last_used_at = $2 WHERE token_hash = $1
+       RETURNING id, user_id, name, scope`,
+      [tokenHash, new Date().toISOString()],
+    );
+    const r = rows[0];
+    return r
+      ? { id: r.id, userId: r.user_id, name: r.name, scope: r.scope }
+      : undefined;
+  }
+
+  async listApiTokens(userId: string): Promise<ApiTokenMeta[]> {
+    const { rows } = await this.pool.query<{
+      id: string;
+      name: string;
+      scope: TokenScope;
+      created_at: string;
+      last_used_at: string | null;
+    }>(
+      'SELECT id, name, scope, created_at, last_used_at FROM api_tokens WHERE user_id = $1 ORDER BY created_at DESC',
+      [userId],
+    );
+    return rows.map((r) => ({
+      id: r.id,
+      name: r.name,
+      scope: r.scope,
+      createdAt: r.created_at,
+      lastUsedAt: r.last_used_at ?? undefined,
+    }));
+  }
+
+  async deleteApiToken(userId: string, id: string): Promise<boolean> {
+    const res = await this.pool.query(
+      'DELETE FROM api_tokens WHERE user_id = $1 AND id = $2',
+      [userId, id],
+    );
+    return (res.rowCount ?? 0) > 0;
   }
 
   async close(): Promise<void> {
