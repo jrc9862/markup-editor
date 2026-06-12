@@ -65,6 +65,7 @@ normal edit.
 
 ```
 apps/server/        Hocuspocus WS server + Express REST + SQLite/Postgres persistence
+                    (auth.ts principals/roles, oidc.ts, auth-routes.ts sign-in/tokens)
 apps/web/           Next.js editor (source + rendered modes, presence)
 packages/sync-core/ applyStringToYText, shared types, presence helpers
 packages/cli/       `markup` CLI: open/sync/status + two-way disk daemon
@@ -93,10 +94,17 @@ reach every connected human (and the CLI daemon → disk) in realtime:
 - `PUT /api/docs/:id/content` `{content}` — direct write (minimal-diffed)
 - `GET|POST /api/docs/:id/comments` · `POST .../comments/:tid/replies` ·
   `POST .../comments/:tid/resolve`
-- `GET|POST /api/docs/:id/suggestions` · `POST .../suggestions/:sid/accept` ·
-  `POST .../suggestions/:sid/reject`
+- `GET|POST /api/docs/:id/suggestions` · `PUT|DELETE .../suggestions/:sid`
+  (author revises/withdraws while open; write capability may touch any) ·
+  `POST .../suggestions/:sid/accept` · `POST .../suggestions/:sid/reject` ·
+  `POST .../suggestions/:sid/replies` (review discussion on a suggestion)
 - `GET .../versions` · `GET .../versions/:vid` · `POST .../restore`
 - `GET /api/me` · `GET|POST /api/tokens` · `DELETE /api/tokens/:id`
+- `GET|POST /api/docs/:id/permissions` · `DELETE .../permissions/:userId` ·
+  `PUT .../permissions/link` (owner only)
+
+Suggestion creation accepts an optional caller-supplied `id` (409 on
+duplicate) — this is how optimistic clients reconcile the server echo.
 
 Agents should run on a scoped API token (`suggest` is the agent-native
 default: propose, never write); the route's required scope is enforced
@@ -145,7 +153,7 @@ cookie (signed-in human; OIDC via `OIDC_ISSUER`/`OIDC_CLIENT_ID`/
 unset), `mkp_`-prefixed API tokens (per-user/per-agent, scoped
 read<comment<suggest<write, managed via `/api/tokens`, hashes only in DB —
 this is also CLI auth: set `MARKUP_TOKEN=mkp_...`), and the legacy shared
-`MARKUP_TOKEN` (default `dev-token`, full access until milestone 2 enforcement).
+`MARKUP_TOKEN` (default `dev-token`, full access unless `MARKUP_REQUIRE_AUTH=1`).
 Scope checks guard every REST route (`needs()` in `index.ts`). Per-doc roles
 (milestone 2): docs carry `owner_id` + `link_role` and a `doc_acl` table maps
 user→role (owner/editor/suggester/commenter/viewer; 'none' link role =
@@ -154,7 +162,10 @@ private). Effective capability = weaker of token scope and doc role
 `GET|POST /api/docs/:id/permissions`, `DELETE .../permissions/:userId`,
 `PUT .../permissions/link`. WS connections below write capability are
 read-only (Hocuspocus drops their updates); suggester/commenter act through
-REST. `MARKUP_REQUIRE_AUTH=1` disables the legacy shared token entirely.
+REST. Permission changes take effect live: the server closes the doc's WS
+connections (`closeConnections(docId)`), providers reconnect and re-resolve
+the role, and the web client refetches `myRole` on every `synced` event
+(revoked users land on an access-revoked screen). `MARKUP_REQUIRE_AUTH=1` disables the legacy shared token entirely.
 Legacy principals and pre-identity (unowned) docs behave as before: full
 access, open collaboration. Signed-in humans are stamped with real name + `authorId` on
 comments/suggestions; self-reported names are ignored. Web uses
@@ -217,11 +228,12 @@ way), mono accents (CSS vars in `globals.css`).
   (`EditorHandle` in `format.ts`) — CodeMirror uses `lineBlockAt`+
   `documentTop`, TipTap maps md→plain→PM pos (binary search on `textBetween`
   length) then `coordsAtPos`. Cards collapse/expand; composers float too.
-- **Inline suggestions**: in source mode, open suggestions render in the text
-  flow — strikethrough mark over the original + a widget with the proposed
-  text and ✓/✕ buttons (`suggestionField` in `SourceEditor.tsx`). In rendered
-  mode the range is highlighted inline (see below) and the accept/reject UI
-  lives in the floating cards.
+- **Suggestions** float as review cards in *both* modes (author, original →
+  proposed, time, accept/reject for write capability, and a comment thread —
+  `replies` on the suggestion, `addSuggestionReply` in sync-core). The only
+  inline rendering is display: in source mode a strikethrough mark over the
+  original + the proposed text (`suggestionField` in `SourceEditor.tsx`); in
+  rendered mode an inline range highlight. No inline accept/reject buttons.
 - **Realtime suggesting mode** (`suggestMode.ts` + toolbar toggle): an
   Editing/Suggesting toggle (source mode only). While Suggesting, a CodeMirror
   `transactionFilter` intercepts user `input`/`delete` transactions, drops the
@@ -231,21 +243,41 @@ way), mono accents (CSS vars in `globals.css`).
   reviewable suggestion: typing splices into `proposed`, backspace un-types
   pending proposed text before widening into a real deletion, moving the
   cursor away starts a new suggestion, fully-un-typed suggestions are removed.
-  `updateSuggestion()` (sync-core) re-anchors and refreshes `original` from
-  the live text. Remote Yjs transactions pass through untouched (they are not
-  user events), so sync keeps working while suggesting.
+  Toolbar formatting routes through the same filter (dispatches are tagged
+  `userEvent: 'input.format'`); a multi-range transaction becomes one
+  discrete suggestion covering the whole span. Remote Yjs transactions pass
+  through untouched (they are not user events), so sync keeps working while
+  suggesting.
+- **Suggestion stores** (`SuggestionStore` in `suggestMode.ts`): intercepted
+  edits land in a store. Editors write straight into the shared Y.Doc
+  (`localStore` in `Editor.tsx`). The **suggester role is an editor locked
+  into Suggesting**: its WS connection is read-only, so its store
+  (`restStore`) keeps an optimistic local overlay (merged into the
+  `suggestions` prop) and syncs through REST — create with a client-supplied
+  id, debounced `PUT` updates, `DELETE` on un-type — reconciling the overlay
+  when the server echo arrives over the wire.
 - **Rendered-mode annotation highlights** (`annotationsPlugin` in
   `RenderedEditor.tsx`): comment/open-suggestion ranges render as PM inline
   decorations (md→plain→PM, the inverse of the selection mapping); fresh sets
   are pushed via `setMeta` on every snapshot refresh and mapped through local
   edits in between. Jumping from a floating card scrolls/selects in place in
   either mode (`focusRange` prop on both editors).
-- **Remote cursors** are terminal-style blinking blocks in both modes. Source
-  mode is y-codemirror.next's awareness cursors (restyled via
-  `.cm-ySelectionCaret`). Rendered mode publishes/consumes the *same*
-  awareness `cursor` field (Y.RelativePosition anchor/head on the canonical
-  Y.Text, mapped md→plain→PM), so presence is cross-mode: source-mode peers
-  see rendered-mode carets and vice versa.
+- **Remote presence** is rendered by our own code in both modes (yCollab gets
+  `null` awareness — y-codemirror's built-in cursors are not used). Both
+  modes publish/consume the same awareness `cursor` field (Y.RelativePosition
+  anchor/head on the canonical Y.Text; rendered mode maps md→plain→PM), so
+  presence is cross-mode. Rendering rule: a peer with a non-empty selection
+  shows only the color highlight; the terminal-style blinking caret renders
+  only for an empty selection.
+- **Cursor-in-range highlight**: both editors report the cursor head as a
+  markdown offset (`onCursorChange`); cards whose anchored range contains it
+  get the `active` accent outline (`activeIds` → `FloatingAnnotations`).
+- **Sharing UI** (`SharePanel.tsx`): Share popover in the topbar — copy link
+  for everyone; owners set the link role and manage per-user grants by email.
+  `UserMenu.tsx` handles sign-in/out (dev prompts or OIDC redirect; reloads
+  the page on identity change). Restricted users see a role badge; the
+  editor is read-only below editor role (commenter/viewer) with
+  comment/suggest/reply/resolve going through REST.
 - **History** (`HistoryPanel.tsx`): togglable right panel from the topbar.
 - **Toolbar** (`Toolbar.tsx`): formatting for non-technical users — heading
   select, bold/italic/underline, inline code, code block, quote, list, HR,
@@ -268,7 +300,11 @@ way), mono accents (CSS vars in `globals.css`).
   for normal prose, but a selection of text that repeats verbatim elsewhere
   in syntax-heavy surroundings can land slightly off. Source mode is exact.
 - Realtime suggesting intercepts plain typing/deleting; IME composition and
-  exotic input paths fall back to direct edits. The coalescing session is
+  exotic input paths fall back to direct edits. The suggester role's
+  REST-backed overlay holds plain offsets while a session is active, so
+  concurrent remote edits in the same spot can shift a pending suggestion's
+  range slightly; suggester realtime typing is source-mode only (rendered
+  mode falls back to select-and-propose). The coalescing session is
   local to one editor instance (two devices suggesting the same spot create
   two suggestions — which is also the correct review granularity).
 - `markup open` startup reconciliation: server state wins for an
