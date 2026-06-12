@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # sync-core first so dependent workspaces resolve its dist/
+      - name: Build sync-core
+        run: npm run build --workspace @markup/sync-core
+
+      - name: Build all workspaces
+        run: npm run build
+
+      - name: Test
+        run: npm test
+
+      - name: Type-check sync-core
+        run: npx tsc -p packages/sync-core/tsconfig.json --noEmit
+
+      - name: Type-check cli
+        run: npx tsc -p packages/cli/tsconfig.json --noEmit
+
+      - name: Type-check server
+        run: npx tsc -p apps/server/tsconfig.json --noEmit
+
+      - name: Type-check web
+        run: npx tsc -p tsconfig.json --noEmit
+        working-directory: apps/web
