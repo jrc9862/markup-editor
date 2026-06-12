@@ -35,6 +35,9 @@ function metaStoreContract(makeStore: () => Promise<MetaStore>) {
 
   it('lists docs most-recently-updated first', async () => {
     await store.create('doc-2', 'other.md');
+    // updated_at has millisecond precision; without this the create and the
+    // touch can tie and the ORDER BY has no defined winner.
+    await new Promise((r) => setTimeout(r, 5));
     await store.touch('doc-1');
     const list = await store.list();
     expect(list.map((d) => d.docId)).toEqual(['doc-1', 'doc-2']);
