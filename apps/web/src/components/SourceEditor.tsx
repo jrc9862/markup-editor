@@ -63,6 +63,8 @@ interface InlineSuggestion {
 interface SuggestionHandlers {
   accept: (id: string) => void;
   reject: (id: string) => void;
+  /** False below write capability: widgets render without ✓/✕ buttons. */
+  canModerate: boolean;
 }
 
 const setSuggestions = StateEffect.define<{
@@ -82,7 +84,11 @@ class SuggestionWidget extends WidgetType {
   }
 
   eq(other: SuggestionWidget): boolean {
-    return other.s.id === this.s.id && other.s.proposed === this.s.proposed;
+    return (
+      other.s.id === this.s.id &&
+      other.s.proposed === this.s.proposed &&
+      other.handlers.canModerate === this.handlers.canModerate
+    );
   }
 
   toDOM(): HTMLElement {
@@ -94,6 +100,7 @@ class SuggestionWidget extends WidgetType {
     proposed.className = 'cm-suggestion-proposed';
     proposed.textContent = this.s.proposed || '∅';
     wrap.appendChild(proposed);
+    if (!this.handlers.canModerate) return wrap;
 
     const accept = document.createElement('button');
     accept.className = 'cm-suggestion-btn accept';
@@ -245,6 +252,8 @@ export default function SourceEditor({
   commentRanges,
   suggestions,
   suggesting,
+  readOnly,
+  canModerate,
   onAccept,
   onReject,
   focusRange,
@@ -258,6 +267,10 @@ export default function SourceEditor({
   suggestions: SuggestionData[];
   /** Realtime suggestion mode: keystrokes become suggestions, not edits. */
   suggesting: boolean;
+  /** Below editor role: the document text cannot be modified locally. */
+  readOnly: boolean;
+  /** Whether this user may accept/reject suggestions (write capability). */
+  canModerate: boolean;
   onAccept: (id: string) => void;
   onReject: (id: string) => void;
   focusRange: { from: number; to: number; key: number } | null;
@@ -268,8 +281,8 @@ export default function SourceEditor({
   const viewRef = useRef<EditorView | null>(null);
   const onSelRef = useRef(onSelectionChange);
   onSelRef.current = onSelectionChange;
-  const handlersRef = useRef({ accept: onAccept, reject: onReject });
-  handlersRef.current = { accept: onAccept, reject: onReject };
+  const handlersRef = useRef({ accept: onAccept, reject: onReject, canModerate });
+  handlersRef.current = { accept: onAccept, reject: onReject, canModerate };
   const suggestingRef = useRef(suggesting);
   suggestingRef.current = suggesting;
   const sessionRef = useRef<SuggestSession | null>(null);
@@ -298,6 +311,8 @@ export default function SourceEditor({
         keymap.of([...defaultKeymap, ...historyKeymap]),
         markdown(),
         EditorView.lineWrapping,
+        EditorState.readOnly.of(readOnly),
+        EditorView.editable.of(!readOnly),
         yCollab(ytext, provider.awareness),
         suggestModeFilter({
           enabled: () => suggestingRef.current,
@@ -340,7 +355,7 @@ export default function SourceEditor({
       onSelRef.current(null);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ytext, provider, user]);
+  }, [ytext, provider, user, readOnly]);
 
   // Push comment highlight ranges into the editor whenever they change.
   useEffect(() => {
@@ -365,11 +380,12 @@ export default function SourceEditor({
         handlers: {
           accept: (id) => handlersRef.current.accept(id),
           reject: (id) => handlersRef.current.reject(id),
+          canModerate: handlersRef.current.canModerate,
         },
       }),
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [JSON.stringify(suggestions)]);
+  }, [JSON.stringify(suggestions), canModerate]);
 
   // Scroll to a range when a floating card asks for it.
   useEffect(() => {

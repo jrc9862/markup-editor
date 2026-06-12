@@ -873,3 +873,67 @@ button { font-family: inherit; cursor: pointer; }
   justify-content: space-between;
   gap: 16px;
 }
+
+/* --- sharing & roles -------------------------------------------------------- */
+
+.role-badge {
+  font-family: var(--mono);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  padding: 2px 8px;
+}
+
+.share {
+  position: relative;
+}
+
+.share-panel {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 40;
+  width: 320px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+}
+
+.share-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--fg);
+}
+
+.share-row input {
+  flex: 1;
+  min-width: 0;
+  background: var(--inset);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  padding: 4px 8px;
+  font-size: 13px;
+}
+
+.share-role {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.share-error {
+  color: var(--red);
+  font-size: 12px;
+}

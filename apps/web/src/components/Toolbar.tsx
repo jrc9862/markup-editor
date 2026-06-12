@@ -11,6 +11,7 @@ import type { FormatTarget } from './format';
 export default function Toolbar({
   format,
   canAnnotate,
+  canSuggestAction = true,
   suggesting,
   suggestingAvailable,
   onSuggestingChange,
@@ -19,6 +20,8 @@ export default function Toolbar({
 }: {
   format: FormatTarget | null;
   canAnnotate: boolean;
+  /** Whether the principal's role allows creating suggestions. */
+  canSuggestAction?: boolean;
   /** Realtime suggestion mode state (source mode only for now). */
   suggesting: boolean;
   suggestingAvailable: boolean;
@@ -177,7 +180,7 @@ export default function Toolbar({
       </button>
       <button
         className="tb-btn wide"
-        disabled={!canAnnotate}
+        disabled={!canAnnotate || !canSuggestAction}
         title="Suggest a change to the selected text"
         onClick={onSuggest}
       >

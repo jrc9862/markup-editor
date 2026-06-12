@@ -138,6 +138,7 @@ export default function RenderedEditor({
   commentRanges = [],
   suggestionRanges = [],
   focusRange = null,
+  readOnly = false,
   onSelectionChange,
   onReady,
 }: {
@@ -149,6 +150,8 @@ export default function RenderedEditor({
   suggestionRanges?: { from: number; to: number }[];
   /** Markdown-offset range to select + scroll to (key forces re-trigger). */
   focusRange?: { from: number; to: number; key: number } | null;
+  /** Below editor role: WYSIWYG editing is disabled. */
+  readOnly?: boolean;
   onSelectionChange?: (sel: { from: number; to: number } | null) => void;
   onReady?: (handle: EditorHandle | null) => void;
 }) {
@@ -228,6 +231,7 @@ export default function RenderedEditor({
       }),
     ],
     content: ytext.toString(),
+    editable: !readOnly,
     immediatelyRender: false,
     editorProps: {
       attributes: { class: 'tiptap' },
