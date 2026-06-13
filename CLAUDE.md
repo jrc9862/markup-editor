@@ -69,6 +69,7 @@ apps/server/        Hocuspocus WS server + Express REST + SQLite/Postgres persis
 apps/web/           Next.js editor (source + rendered modes, presence)
 packages/sync-core/ applyStringToYText, shared types, presence helpers
 packages/cli/       `markup` CLI: open/sync/status + two-way disk daemon
+packages/mcp-server/ `markup-mcp`: stdio MCP server over the agent REST surface
 ```
 
 - One document = one Yjs room; `docId` (uuid) is the room name and URL slug.
@@ -327,28 +328,27 @@ way), mono accents (CSS vars in `globals.css`).
 4. **Conflict-free offline `sync`** — persist the CLI's Yjs state vector in
    `.markup/` so offline edits three-way-merge instead of server-wins.
 5. **Named versions + per-author attribution** in history.
-6. **MCP server** — wrap the agent REST surface in an MCP server
-   (`markup-mcp`) so Claude Code / other agents get native tools
-   (read_doc, comment, suggest, accept, list_docs) without hand-rolled curl.
-7. **Agent identity & events** — distinguish agent principals from humans
+6. **Agent identity & events** — distinguish agent principals from humans
    (presence badges, per-agent tokens), plus webhooks/SSE so agents can
    subscribe to mentions, new comments, or suggestion reviews instead of
    polling.
-8. **Realtime suggesting in rendered mode** — the Suggesting toggle currently
+7. **Realtime suggesting in rendered mode** — the Suggesting toggle currently
    covers source mode only; rendered mode needs the equivalent interception
    at the ProseMirror transaction level.
-9. **File rename handling** — renaming a file on disk (or in the UI) should
+8. **File rename handling** — renaming a file on disk (or in the UI) should
    update the doc's name/path everywhere: manifest remapping in the CLI,
    doc_meta, the doc-list tree, and open editor topbars.
-10. **Live, intelligently grouped history** — the history panel should hot-
-    reload as edits land in the current doc, with changes grouped into
-    meaningful versions (e.g. by author + editing burst), not just the
-    fixed ≥60s debounce.
-11. **History as local version preview** — selecting a version shows that
+9. **Live, intelligently grouped history** — the history panel should hot-
+   reload as edits land in the current doc, with changes grouped into
+   meaningful versions (e.g. by author + editing burst), not just the
+   fixed ≥60s debounce.
+10. **History as local version preview** — selecting a version shows that
     version of the document read-only to *just the selecting user* (no
     diff view, no effect on other collaborators), with restore as an
     explicit follow-up action.
 
 Shipped from the original roadmap: togglable realtime suggestion mode
 (source), in-rendered-view annotation highlights, cross-mode presence
-(terminal-style remote cursors in both modes).
+(terminal-style remote cursors in both modes), and the **MCP server**
+(`packages/mcp-server` → `markup-mcp`, a stdio wrapper over the agent REST
+surface: read_doc, comment, suggest, accept, list_docs, …).
