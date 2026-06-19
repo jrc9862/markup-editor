@@ -44,6 +44,13 @@ export const persistDuration = new Histogram({
   registers: [registry],
 });
 
+/** Version snapshots dropped by the retention policy (Phase 2 history pruning). */
+export const versionsPruned = new Counter({
+  name: 'markup_versions_pruned_total',
+  help: 'doc_versions snapshots removed by the retention policy',
+  registers: [registry],
+});
+
 /** REST request latency, labelled by method/route/status. */
 export const httpDuration = new Histogram({
   name: 'markup_http_request_duration_seconds',

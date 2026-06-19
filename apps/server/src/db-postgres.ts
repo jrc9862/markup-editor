@@ -8,7 +8,13 @@ import type {
   TokenScope,
   VersionMeta,
 } from '@markup/sync-core';
-import type { ApiTokenRow, MetaStore, SessionRow } from './db.js';
+import type {
+  ApiTokenRow,
+  MetaStore,
+  RetentionPolicy,
+  SessionRow,
+} from './db.js';
+import { retentionDisabled } from './db.js';
 
 /**
  * Ordered, additive migrations — append only, never edit a shipped entry.
@@ -294,6 +300,37 @@ export class PostgresMetaStore implements MetaStore {
       [docId, versionId],
     );
     return rows[0]?.content;
+  }
+
+  async pruneVersions(docId: string, policy: RetentionPolicy): Promise<number> {
+    if (retentionDisabled(policy)) return 0;
+    const ageCutoff =
+      policy.maxAgeDays > 0
+        ? new Date(Date.now() - policy.maxAgeDays * 86_400_000).toISOString()
+        : null;
+    const res = await this.pool.query(
+      `DELETE FROM doc_versions
+       WHERE doc_id = $1
+         AND name IS NULL
+         AND id <> (SELECT id FROM doc_versions WHERE doc_id = $1 ORDER BY id DESC LIMIT 1)
+         AND (
+               ($2 > 0 AND id NOT IN (
+                  SELECT id FROM doc_versions WHERE doc_id = $1 ORDER BY id DESC LIMIT $2))
+            OR ($3::text IS NOT NULL AND created_at < $3)
+         )`,
+      [docId, policy.maxCount, ageCutoff],
+    );
+    return res.rowCount ?? 0;
+  }
+
+  async pruneAllVersions(policy: RetentionPolicy): Promise<number> {
+    if (retentionDisabled(policy)) return 0;
+    const { rows } = await this.pool.query<{ doc_id: string }>(
+      'SELECT DISTINCT doc_id FROM doc_versions',
+    );
+    let total = 0;
+    for (const r of rows) total += await this.pruneVersions(r.doc_id, policy);
+    return total;
   }
 
   // --- Identity -------------------------------------------------------------
