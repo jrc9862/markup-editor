@@ -1,0 +1,60 @@
+# Multi-node (HA) overlay for the production stack. Layer it on top of the base
+# compose file:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.scale.yml \
+#     --profile app up -d --build --scale server=2
+#
+# What it changes vs. the single-node `app` profile:
+#   - adds `redis` — cross-node Yjs update + awareness fan-out, the docEvents
+#     SSE bus, and the lastEditor (version attribution) store;
+#   - points the server replicas at Redis (REDIS_URL) and tells them to trust
+#     one proxy hop (MARKUP_TRUST_PROXY=1) so rate limiting keys on the real
+#     client IP behind the LB;
+#   - drops the server's host port (`ports: !reset []`, needs Compose ≥ 2.24)
+#     so N replicas don't fight over :4000 — nginx owns it instead;
+#   - adds `lb` (nginx, deploy/nginx.conf) terminating client traffic on :4000
+#     and balancing across the replicas with WS-aware proxying.
+#
+# The browser still talks to :4000 (now nginx), so NEXT_PUBLIC_MARKUP_SERVER is
+# unchanged. State stays in Postgres; Redis holds no durable data.
+services:
+  redis:
+    image: redis:7-alpine
+    profiles: [app]
+    # Pure fan-out / ephemeral coordination — no persistence needed.
+    command: ['redis-server', '--save', '', '--appendonly', 'no']
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  server:
+    # nginx owns the public port; replicas must not each bind :4000.
+    ports: !reset []
+    environment:
+      DATABASE_URL: postgres://markup:markup@postgres:5432/markup
+      MARKUP_TOKEN: ${MARKUP_TOKEN:-dev-token}
+      REDIS_URL: redis://redis:6379
+      MARKUP_TRUST_PROXY: '1'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  lb:
+    image: nginx:1.27-alpine
+    profiles: [app]
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - '4000:4000'
+    depends_on:
+      server:
+        condition: service_healthy
+
+  web:
+    depends_on:
+      lb:
+        condition: service_started

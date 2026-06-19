@@ -201,6 +201,14 @@ snapshots kept per doc, default 500; `0` disables the count cap) /
 `MARKUP_VERSION_RETENTION_DAYS` (prune versions older than N days, default `0`
 = off) — retention never drops a user-named version or a doc's most-recent
 snapshot, and runs after each new snapshot plus a one-shot startup sweep.
+Phase 2 multi-node env (optional): `REDIS_URL` (when set, enables the
+cross-node layer — Hocuspocus Redis extension for Yjs/awareness fan-out, the
+`docEvents` SSE bus bridged onto Redis pub/sub, and the `lastEditor`
+attribution store moved into Redis; unset = single-node in-process, unchanged)
+and `MARKUP_TRUST_PROXY` (trusted reverse-proxy hop count, default `0`; `>0`
+makes Express derive the real client IP from `X-Forwarded-For` so rate limiting
+keys per client behind the LB). See `apps/server/src/redis.ts`,
+`docker-compose.scale.yml`, `deploy/nginx.conf`.
 `NEXT_PUBLIC_*` values are inlined into the web bundle at
 **build time** — for a deployed web image they are Docker build args, not
 runtime env.
@@ -373,9 +381,12 @@ way), mono accents (CSS vars in `globals.css`).
    per-user WS caps, doc byte-size guard); plus history retention + backups
    (`doc_versions` count/age caps that spare named + latest snapshots,
    `scripts/backup.sh` for pg_dump/SQLite `.backup`). Yjs state is a single
-   GC'd snapshot per doc (no update log to compact). Remaining: Redis
-   multi-node (incl. moving the in-process `docEvents` bus + `lastEditor` map
-   onto Redis pub/sub), k6 load testing (see ENTERPRISE_PLAN.md, PHASE2_OPS.md).
+   GC'd snapshot per doc (no update log to compact). Plus Redis multi-node
+   (gated by `REDIS_URL`): Hocuspocus Redis extension for Yjs/awareness
+   fan-out, with the in-process `docEvents` SSE bus and `lastEditor`
+   attribution map moved onto Redis (`apps/server/src/redis.ts`), and an LB
+   topology in `docker-compose.scale.yml` + `deploy/nginx.conf`. Remaining: k6
+   load testing (see ENTERPRISE_PLAN.md, PHASE2_OPS.md).
 
 Shipped from the original roadmap: togglable realtime suggestion mode
 (both source and rendered modes), in-rendered-view annotation highlights,
