@@ -39,6 +39,7 @@ import {
 import { registerAuthRoutes, registerTokenRoutes } from './auth-routes.js';
 import { oidcFromEnv } from './oidc.js';
 import { docEvents, extractMentions, type DocEvent } from './events.js';
+import { GitBridge, isValidRef } from './git.js';
 import {
   PostgresMetaStore,
   fetchYjsState,
@@ -57,6 +58,9 @@ const LEGACY_TOKEN = REQUIRE_AUTH ? undefined : TOKEN;
 const SERVER_ORIGIN =
   process.env.MARKUP_SERVER_ORIGIN ?? `http://localhost:${PORT}`;
 const OIDC = oidcFromEnv(SERVER_ORIGIN);
+// Git-native flows are enabled only when the server can reach a working tree
+// (MARKUP_REPO_DIR) — the self-hosted/local shape. Otherwise the routes 404.
+const git = GitBridge.fromEnv();
 
 // --- Data layer: Postgres when DATABASE_URL is set, SQLite otherwise --------
 //
@@ -789,6 +793,50 @@ app.post(
   },
 );
 
+/**
+ * PR-style batch review (roadmap #3): accept and/or reject a set of open
+ * suggestions in ONE transaction — the reviewer dispositions a whole batch at
+ * once, applied atomically and propagated like a single edit.
+ */
+app.post(
+  '/api/docs/:docId/suggestions/review',
+  needs('write'),
+  docAccess('write'),
+  async (req, res) => {
+    const body = req.body as { accept?: string[]; reject?: string[] };
+    const accept = Array.isArray(body.accept) ? body.accept : [];
+    const reject = Array.isArray(body.reject) ? body.reject : [];
+    if (accept.length === 0 && reject.length === 0) {
+      res.status(400).json({ error: 'provide accept[] and/or reject[]' });
+      return;
+    }
+    const result = await withDoc(req.params.docId, (doc) => {
+      const ytext = doc.getText(CONTENT_FIELD);
+      let accepted = 0;
+      let rejected = 0;
+      // Accept in descending range order so earlier offsets stay valid as
+      // later replacements resize the text.
+      const toAccept = accept
+        .map((id) => ({ id, s: getSuggestion(doc, id) }))
+        .filter((x) => x.s && x.s.status === 'open')
+        .sort((a, b) => (b.s!.from ?? 0) - (a.s!.from ?? 0));
+      for (const { id } of toAccept) {
+        if (acceptSuggestion(doc, ytext, id)) accepted++;
+      }
+      for (const id of reject) {
+        const s = getSuggestion(doc, id);
+        if (s && s.status === 'open') {
+          rejectSuggestion(doc, id);
+          rejected++;
+        }
+      }
+      return { accepted, rejected };
+    });
+    if (result.accepted > 0) publish(res, req.params.docId, { type: 'content' });
+    res.json(result);
+  },
+);
+
 // --- Sharing / permissions (owner only) ---------------------------------------
 
 const ownerOnly: express.RequestHandler = async (req, res, next) => {
@@ -874,6 +922,85 @@ app.put('/api/docs/:docId/permissions/link', ownerOnly, async (req, res) => {
   await meta.setLinkRole(req.params.docId, role as never);
   kickDocConnections(req.params.docId);
   res.json({ ok: true });
+});
+
+// --- Git-native flows (roadmap #3) --------------------------------------------
+//
+// Commit/branch the real .md files from the UI. Enabled only when the server
+// has a working tree (MARKUP_REPO_DIR); all git args are passed as arrays, so
+// messages and paths can't inject. Read ops need read scope; mutations need
+// write scope (repo-global, not per-doc).
+
+const gitEnabled: express.RequestHandler = (_req, res, next) => {
+  if (!git) {
+    res.status(404).json({ error: 'git flows are not enabled on this server' });
+    return;
+  }
+  next();
+};
+
+app.get('/api/git/status', needs('read'), gitEnabled, async (_req, res) => {
+  try {
+    res.json(await git!.status());
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
+app.get('/api/git/branches', needs('read'), gitEnabled, async (_req, res) => {
+  try {
+    res.json({
+      current: await git!.currentBranch(),
+      branches: await git!.listBranches(),
+    });
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
+app.post('/api/git/commit', needs('write'), gitEnabled, async (req, res) => {
+  const body = req.body as { message?: string; paths?: string[] };
+  if (typeof body.message !== 'string' || !body.message.trim()) {
+    res.status(400).json({ error: 'message is required' });
+    return;
+  }
+  if (body.paths && !Array.isArray(body.paths)) {
+    res.status(400).json({ error: 'paths must be an array' });
+    return;
+  }
+  try {
+    res.json(await git!.commit(body.message.trim(), body.paths));
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+app.post('/api/git/branch', needs('write'), gitEnabled, async (req, res) => {
+  const body = req.body as { name?: string; checkout?: boolean };
+  if (!isValidRef(body.name ?? '')) {
+    res.status(400).json({ error: 'invalid branch name' });
+    return;
+  }
+  try {
+    await git!.createBranch(body.name!, body.checkout ?? true);
+    res.json({ ok: true, branch: body.name });
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+app.post('/api/git/checkout', needs('write'), gitEnabled, async (req, res) => {
+  const name = (req.body as { name?: string }).name;
+  if (!isValidRef(name ?? '')) {
+    res.status(400).json({ error: 'invalid branch name' });
+    return;
+  }
+  try {
+    await git!.checkout(name!);
+    res.json({ ok: true, branch: name });
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
 });
 
 // --- Edit history -------------------------------------------------------------
