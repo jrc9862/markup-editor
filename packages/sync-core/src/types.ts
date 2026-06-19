@@ -46,6 +46,12 @@ export interface VersionMeta {
   createdAt: string;
   /** Size of the version's content in bytes. */
   size: number;
+  /** Optional human-given label for the version (e.g. "v1.0 draft"). */
+  name?: string;
+  /** Best-effort attribution: display name of the last editor before snapshot. */
+  author?: string;
+  /** Stable user id of the last editor, when known. */
+  authorId?: string;
 }
 
 // --- Identity (Phase 1) -------------------------------------------------------

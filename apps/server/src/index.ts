@@ -79,6 +79,19 @@ const persistence = pool
 
 // --- Hocuspocus: the Yjs sync engine + persistence -------------------------
 
+/** Best-effort attribution label for a principal (for version history). */
+function principalLabel(p: Principal): { author?: string; authorId?: string } {
+  if (p.kind === 'user') return { author: p.user.name, authorId: p.user.id };
+  if (p.kind === 'agent') return { author: p.tokenName, authorId: p.user.id };
+  return {};
+}
+
+// The most recent editor per doc, captured from authenticated connections (and
+// REST writers). Consumed when onStoreDocument snapshots a version, so history
+// carries best-effort per-author attribution. In-memory only — attribution is
+// a display nicety, not a source of truth.
+const lastEditor = new Map<string, { author?: string; authorId?: string }>();
+
 const hocuspocus = Hocuspocus.configure({
   extensions: [persistence],
 
@@ -102,14 +115,30 @@ const hocuspocus = Hocuspocus.configure({
     // incoming doc updates server-side. Suggester/commenter roles act
     // through the REST surface instead.
     if (!scopeAllows(scope, 'write')) connection.readOnly = true;
+    // The returned value becomes the connection context; onChange uses it to
+    // attribute the resulting version snapshot.
+    return principalLabel(principal);
+  },
+
+  async onChange({ documentName, context }) {
+    const c = context as { author?: string; authorId?: string } | undefined;
+    if (c?.author) lastEditor.set(documentName, c);
   },
 
   async onStoreDocument({ documentName, document }) {
     await meta.touch(documentName);
     // Edit history: snapshot the markdown, debounced inside maybeAddVersion
-    // so active typing doesn't create a version per save.
+    // so active typing doesn't create a version per save. Stamp the snapshot
+    // with the most recent editor we saw.
     const content = document.getText(CONTENT_FIELD).toString();
-    await meta.maybeAddVersion(documentName, content);
+    const editor = lastEditor.get(documentName);
+    await meta.maybeAddVersion(
+      documentName,
+      content,
+      undefined,
+      editor?.author,
+      editor?.authorId,
+    );
   },
 });
 
@@ -371,6 +400,8 @@ app.put('/api/docs/:docId/content', needs('write'), docAccess('write'), async (r
   await withDoc(req.params.docId, (doc) =>
     applyStringToYText(doc.getText(CONTENT_FIELD), content),
   );
+  // Direct (REST) writes carry no WS context, so attribute the snapshot here.
+  lastEditor.set(req.params.docId, principalLabel(res.locals.principal as Principal));
   res.json({ ok: true });
 });
 
@@ -702,6 +733,25 @@ app.put('/api/docs/:docId/permissions/link', ownerOnly, async (req, res) => {
 
 app.get('/api/docs/:docId/versions', needs('read'), docAccess('read'), async (req, res) => {
   res.json(await meta.listVersions(req.params.docId));
+});
+
+/** Give a version a human-friendly name (editorial action → write). */
+app.put('/api/docs/:docId/versions/:versionId', needs('write'), docAccess('write'), async (req, res) => {
+  const name = (req.body as { name?: string })?.name;
+  if (typeof name !== 'string' || !name.trim()) {
+    res.status(400).json({ error: 'name (non-empty string) is required' });
+    return;
+  }
+  const ok = await meta.nameVersion(
+    req.params.docId,
+    Number(req.params.versionId),
+    name.trim(),
+  );
+  if (!ok) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+  res.json({ ok: true });
 });
 
 app.get('/api/docs/:docId/versions/:versionId', needs('read'), docAccess('read'), async (req, res) => {

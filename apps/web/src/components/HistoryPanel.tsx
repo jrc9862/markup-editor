@@ -61,6 +61,18 @@ export default function HistoryPanel({
     load();
   };
 
+  const nameVersion = async (v: VersionMeta) => {
+    const name = window.prompt('Name this version', v.name ?? '');
+    if (name === null || !name.trim()) return;
+    await fetch(`${SERVER_HTTP}/api/docs/${docId}/versions/${v.id}`, {
+      method: 'PUT',
+      headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ name: name.trim() }),
+    });
+    load();
+  };
+
   return (
     <aside className="history-panel">
       <div className="history-title">
@@ -75,10 +87,16 @@ export default function HistoryPanel({
         {versions.map((v) => (
           <div className="card version" key={v.id}>
             <div className="card-head clickable" onClick={() => openVersion(v.id)}>
-              <strong className="mono">v{v.id}</strong>
+              <strong className="mono">{v.name ?? `v${v.id}`}</strong>
               <span className="when">{new Date(v.createdAt).toLocaleString()}</span>
               <span className="when">{v.size} B</span>
             </div>
+            {(v.author || v.name) && (
+              <div className="version-meta">
+                {v.author && <span className="version-author">{v.author}</span>}
+                {v.name && <span className="when">v{v.id}</span>}
+              </div>
+            )}
             {openId === v.id && diff && (
               <>
                 <div className="diff-view">
@@ -99,6 +117,9 @@ export default function HistoryPanel({
                 <div className="card-actions">
                   <button className="primary-btn" onClick={() => restore(v.id)}>
                     Restore this version
+                  </button>
+                  <button className="ghost-btn" onClick={() => nameVersion(v)}>
+                    {v.name ? 'Rename' : 'Name…'}
                   </button>
                 </div>
               </>

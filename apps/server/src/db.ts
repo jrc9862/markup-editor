@@ -53,12 +53,20 @@ export interface MetaStore {
     docId: string,
     content: string,
     minIntervalMs?: number,
+    author?: string,
+    authorId?: string,
   ): Promise<boolean>;
   listVersions(docId: string): Promise<VersionMeta[]>;
   getVersionContent(
     docId: string,
     versionId: number,
   ): Promise<string | undefined>;
+  /** Give a version a human label; returns false if the version is gone. */
+  nameVersion(
+    docId: string,
+    versionId: number,
+    name: string,
+  ): Promise<boolean>;
 
   // --- Identity (Phase 1). Sessions and API tokens store sha256 hashes only.
   /** Insert by email, or refresh the name on an existing user. */
@@ -134,7 +142,10 @@ export class SqliteMetaStore implements MetaStore {
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         doc_id TEXT NOT NULL,
         content TEXT NOT NULL,
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        name TEXT,
+        author TEXT,
+        author_id TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_versions_doc
         ON doc_versions (doc_id, id DESC);
@@ -178,6 +189,17 @@ export class SqliteMetaStore implements MetaStore {
       ['link_role', 'ALTER TABLE doc_meta ADD COLUMN link_role TEXT'],
     ] as const) {
       if (!cols.some((c) => c.name === col)) this.db.exec(ddl);
+    }
+    // Older doc_versions tables lack named-version / attribution columns.
+    const vcols = this.db
+      .prepare('PRAGMA table_info(doc_versions)')
+      .all() as Array<{ name: string }>;
+    for (const [col, ddl] of [
+      ['name', 'ALTER TABLE doc_versions ADD COLUMN name TEXT'],
+      ['author', 'ALTER TABLE doc_versions ADD COLUMN author TEXT'],
+      ['author_id', 'ALTER TABLE doc_versions ADD COLUMN author_id TEXT'],
+    ] as const) {
+      if (!vcols.some((c) => c.name === col)) this.db.exec(ddl);
     }
   }
 
@@ -247,6 +269,8 @@ export class SqliteMetaStore implements MetaStore {
     docId: string,
     content: string,
     minIntervalMs = 60_000,
+    author?: string,
+    authorId?: string,
   ): Promise<boolean> {
     const last = this.db
       .prepare(
@@ -261,24 +285,45 @@ export class SqliteMetaStore implements MetaStore {
 
     this.db
       .prepare(
-        'INSERT INTO doc_versions (doc_id, content, created_at) VALUES (?, ?, ?)',
+        'INSERT INTO doc_versions (doc_id, content, created_at, author, author_id) VALUES (?, ?, ?, ?, ?)',
       )
-      .run(docId, content, new Date().toISOString());
+      .run(docId, content, new Date().toISOString(), author ?? null, authorId ?? null);
     return true;
   }
 
   async listVersions(docId: string): Promise<VersionMeta[]> {
     const rows = this.db
       .prepare(
-        'SELECT id, created_at, LENGTH(content) AS size FROM doc_versions WHERE doc_id = ? ORDER BY id DESC',
+        'SELECT id, created_at, name, author, author_id, LENGTH(content) AS size FROM doc_versions WHERE doc_id = ? ORDER BY id DESC',
       )
-      .all(docId) as Array<{ id: number; created_at: string; size: number }>;
+      .all(docId) as Array<{
+      id: number;
+      created_at: string;
+      name: string | null;
+      author: string | null;
+      author_id: string | null;
+      size: number;
+    }>;
     return rows.map((r) => ({
       id: r.id,
       docId,
       createdAt: r.created_at,
       size: r.size,
+      name: r.name ?? undefined,
+      author: r.author ?? undefined,
+      authorId: r.author_id ?? undefined,
     }));
+  }
+
+  async nameVersion(
+    docId: string,
+    versionId: number,
+    name: string,
+  ): Promise<boolean> {
+    const res = this.db
+      .prepare('UPDATE doc_versions SET name = ? WHERE doc_id = ? AND id = ?')
+      .run(name, docId, versionId);
+    return res.changes > 0;
   }
 
   async getVersionContent(
