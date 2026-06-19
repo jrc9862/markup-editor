@@ -673,6 +673,23 @@ button { font-family: inherit; cursor: pointer; }
   outline: 1px solid var(--accent);
 }
 
+.version-group {
+  margin-bottom: 10px;
+}
+
+.version-group-head {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  padding: 4px 2px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 4px;
+}
+
+.version-group .card.version {
+  margin-left: 8px;
+}
+
 .version-preview-bar {
   display: flex;
   justify-content: space-between;

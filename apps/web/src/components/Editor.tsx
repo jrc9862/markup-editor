@@ -721,6 +721,7 @@ export default function Editor({ docId }: { docId: string }) {
         {showHistory && conn && (
           <HistoryPanel
             docId={docId}
+            liveTick={layoutTick}
             previewingId={preview?.id ?? null}
             onPreview={(v, content) =>
               setPreview({ id: v.id, label: v.name ?? `v${v.id}`, content })
