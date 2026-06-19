@@ -104,7 +104,8 @@ by an enterprise today.
    server-side enforcement, attribution.
 3. **Phase 2 (scale/ops)**: Redis multi-node, observability, backups, rate
    limits, load testing.
-   - **Slice 1 — observability + limits (shipped).** Structured logging
+   - **Slice 1 — observability + limits (shipped; see PHASE2_OPS.md).**
+     Structured logging
      (pino/pino-http with per-request principal attribution), Prometheus
      `/metrics` (ws connections, docs loaded, update throughput, persistence
      + REST latency), liveness `/healthz` vs readiness `/readyz`
