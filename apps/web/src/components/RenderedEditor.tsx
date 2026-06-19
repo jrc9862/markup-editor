@@ -17,6 +17,11 @@ import { Decoration, DecorationSet } from '@tiptap/pm/view';
 import type { Node as PMNode } from '@tiptap/pm/model';
 import { applyStringToYText, mapOffsetThroughDiff } from '@markup/sync-core';
 import type { EditorHandle } from './format';
+import {
+  recordRenderedEdit,
+  type SuggestSession,
+  type SuggestionStore,
+} from './suggestMode';
 
 /**
  * Origin tag for Yjs transactions produced by this binding, so its own
@@ -86,6 +91,8 @@ const annotationsPlugin = new Plugin<DecorationSet>({
   },
 });
 
+const suggestFilterKey = new PluginKey('suggestFilter');
+
 /**
  * Remote cursors: rendered mode publishes/consumes the same awareness
  * `cursor` field as y-codemirror.next (relative positions on the canonical
@@ -110,6 +117,15 @@ const remoteCursorsPlugin = new Plugin<DecorationSet>({
     },
   },
 });
+
+/** Inline "proposed text" widget for an open suggestion (display only; the
+ *  accept/reject controls live in the floating cards), mirroring source mode. */
+function suggestionProposedDom(text: string): HTMLElement {
+  const span = document.createElement('span');
+  span.className = 'pm-suggestion-proposed';
+  span.textContent = text || '∅';
+  return span;
+}
 
 function remoteCaretDom(name: string, color: string): HTMLElement {
   const caret = document.createElement('span');
@@ -136,7 +152,9 @@ export default function RenderedEditor({
   ytext,
   provider,
   commentRanges = [],
-  suggestionRanges = [],
+  suggestionItems = [],
+  suggesting = false,
+  suggestStore,
   focusRange = null,
   readOnly = false,
   onSelectionChange,
@@ -146,9 +164,14 @@ export default function RenderedEditor({
   ytext: Y.Text;
   /** Used for presence (remote cursors via the shared awareness protocol). */
   provider: HocuspocusProvider;
-  /** Markdown-offset ranges to highlight as comments / open suggestions. */
+  /** Markdown-offset ranges to highlight as comments. */
   commentRanges?: { from: number; to: number }[];
-  suggestionRanges?: { from: number; to: number }[];
+  /** Open suggestions: range to strike through plus their proposed text. */
+  suggestionItems?: { from: number; to: number; proposed: string }[];
+  /** Realtime suggesting mode: WYSIWYG edits become suggestions, not edits. */
+  suggesting?: boolean;
+  /** Where intercepted suggest-mode edits are recorded. */
+  suggestStore?: SuggestionStore;
   /** Markdown-offset range to select + scroll to (key forces re-trigger). */
   focusRange?: { from: number; to: number; key: number } | null;
   /** Below editor role: WYSIWYG editing is disabled. */
@@ -167,6 +190,25 @@ export default function RenderedEditor({
   onCursorRef.current = onCursorChange;
   const onReadyRef = useRef(onReady);
   onReadyRef.current = onReady;
+
+  // Realtime suggesting: a vetoed ProseMirror edit is folded into a suggestion
+  // instead of touching the doc (the rendered-mode analogue of source mode's
+  // transactionFilter). Refs keep the filter (created once) reading live state.
+  const suggestingRef = useRef(suggesting);
+  suggestingRef.current = suggesting;
+  const storeRef = useRef(suggestStore);
+  storeRef.current = suggestStore;
+  const sessionRef = useRef<SuggestSession | null>(null);
+  // The tiptap-markdown serializer can serialize an arbitrary doc, so we can
+  // ask "what markdown would this (vetoed) edit have produced?" without
+  // applying it. Captured once the editor exists.
+  const serializerRef = useRef<{ serialize: (doc: PMNode) => string } | null>(null);
+
+  // Leaving suggest mode ends the current coalescing run; the next keystroke
+  // after re-enabling starts a fresh suggestion.
+  useEffect(() => {
+    if (!suggesting) sessionRef.current = null;
+  }, [suggesting]);
 
   /**
    * Translate the ProseMirror selection into offsets in the canonical
@@ -256,10 +298,56 @@ export default function RenderedEditor({
   // Clear any reported selection when this editor unmounts (mode switch).
   useEffect(() => () => onSelRef.current?.(null), []);
 
+  // Capture the markdown serializer so the suggest filter can serialize a
+  // proposed (vetoed) doc to markdown.
+  useEffect(() => {
+    serializerRef.current = editor
+      ? (editor.storage.markdown.serializer as { serialize: (doc: PMNode) => string })
+      : null;
+  }, [editor]);
+
+  // Realtime suggesting interception. A plugin-level filterTransaction is the
+  // rendered-mode analogue of source mode's CodeMirror transactionFilter:
+  // while suggesting, veto a user edit and fold the markdown it *would* have
+  // produced into the suggestion layer instead. Remote re-parses
+  // (applyingRemote) and decoration-only transactions pass through, so sync
+  // keeps working.
+  useEffect(() => {
+    if (!editor) return;
+    const plugin = new Plugin({
+      key: suggestFilterKey,
+      filterTransaction: (tr, state) => {
+        if (!suggestingRef.current || applyingRemote.current || !tr.docChanged) {
+          return true;
+        }
+        const store = storeRef.current;
+        const serializer = serializerRef.current;
+        if (!store || !serializer) return true;
+        try {
+          const proposed = serializer.serialize(tr.doc);
+          const current = ytext.toString();
+          if (proposed === current) return true;
+          // Backspace moves the caret left (head shrinks); delete-forward keeps
+          // it. That tells recordRenderedEdit whether to un-type before/after.
+          const backward = tr.selection.head < state.selection.head;
+          recordRenderedEdit(store, current, sessionRef, proposed, backward);
+        } catch {
+          // If serialization/diff fails, let the edit apply rather than lose it.
+          return true;
+        }
+        return false;
+      },
+    });
+    editor.registerPlugin(plugin);
+    return () => {
+      editor.unregisterPlugin(suggestFilterKey);
+    };
+  }, [editor, ytext]);
+
   // --- annotation highlights -------------------------------------------------
 
-  const rangesRef = useRef({ comments: commentRanges, suggestions: suggestionRanges });
-  rangesRef.current = { comments: commentRanges, suggestions: suggestionRanges };
+  const rangesRef = useRef({ comments: commentRanges, suggestions: suggestionItems });
+  rangesRef.current = { comments: commentRanges, suggestions: suggestionItems };
 
   useEffect(() => {
     if (!editor) return;
@@ -285,12 +373,31 @@ export default function RenderedEditor({
             Decoration.inline(m.from, m.to, { class: 'pm-annotation comment' }),
           );
       }
-      for (const r of rangesRef.current.suggestions) {
-        const m = pmRangeFromMdRange(doc, md, plain, r);
-        if (m)
+      for (const s of rangesRef.current.suggestions) {
+        const m = pmRangeFromMdRange(doc, md, plain, s);
+        let widgetPos: number | null = null;
+        if (m) {
           decos.push(
             Decoration.inline(m.from, m.to, { class: 'pm-annotation suggestion' }),
           );
+          widgetPos = m.to;
+        } else if (s.to <= s.from) {
+          // Pure insertion (e.g. realtime typing): no range to strike, so just
+          // place the proposed-text widget at the insertion point.
+          widgetPos = pmPosFromPlainOffset(
+            doc,
+            mapOffsetThroughDiff(md, plain, s.from, 'right'),
+          );
+        }
+        if (s.proposed && widgetPos !== null) {
+          const text = s.proposed;
+          decos.push(
+            Decoration.widget(widgetPos, () => suggestionProposedDom(text), {
+              side: 1,
+              key: `sug-${s.from}-${s.to}-${text}`,
+            }),
+          );
+        }
       }
       // setMeta-only transaction: no doc change, so no onUpdate feedback.
       editor.view.dispatch(
@@ -303,7 +410,7 @@ export default function RenderedEditor({
       editor.off('update', push);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [editor, ytext, JSON.stringify(commentRanges), JSON.stringify(suggestionRanges)]);
+  }, [editor, ytext, JSON.stringify(commentRanges), JSON.stringify(suggestionItems)]);
 
   useEffect(() => {
     editor?.setEditable(!readOnly);

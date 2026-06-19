@@ -234,21 +234,29 @@ way), mono accents (CSS vars in `globals.css`).
   `replies` on the suggestion, `addSuggestionReply` in sync-core). The only
   inline rendering is display: in source mode a strikethrough mark over the
   original + the proposed text (`suggestionField` in `SourceEditor.tsx`); in
-  rendered mode an inline range highlight. No inline accept/reject buttons.
+  rendered mode a strikethrough range highlight plus a green proposed-text
+  widget (`pm-suggestion-proposed`) at the range end / insertion point. No
+  inline accept/reject buttons.
 - **Realtime suggesting mode** (`suggestMode.ts` + toolbar toggle): an
-  Editing/Suggesting toggle (source mode only). While Suggesting, a CodeMirror
-  `transactionFilter` intercepts user `input`/`delete` transactions, drops the
-  doc change, and folds the edit into a suggestion object instead — the same
-  objects select-and-propose and the REST surface create. A local "session"
-  ({suggestion id, caret-in-proposed}) coalesces a run of keystrokes into one
-  reviewable suggestion: typing splices into `proposed`, backspace un-types
-  pending proposed text before widening into a real deletion, moving the
-  cursor away starts a new suggestion, fully-un-typed suggestions are removed.
-  Toolbar formatting routes through the same filter (dispatches are tagged
-  `userEvent: 'input.format'`); a multi-range transaction becomes one
-  discrete suggestion covering the whole span. Remote Yjs transactions pass
-  through untouched (they are not user events), so sync keeps working while
-  suggesting.
+  Editing/Suggesting toggle, available in **both** modes. While Suggesting, a
+  user edit never touches the doc — it is intercepted and folded into a
+  suggestion object instead (the same objects select-and-propose and the REST
+  surface create). Source mode uses a CodeMirror `transactionFilter` on
+  `input`/`delete` transactions; rendered mode uses a ProseMirror plugin
+  `filterTransaction` that vetoes the edit, serializes the *would-be* doc to
+  markdown (`editor.storage.markdown.serializer`), and diffs it against the
+  current markdown (`singleRegionDiff`) to recover the change in markdown
+  coordinates. Both feed the shared `recordSuggestionEdit`/`recordRenderedEdit`
+  coalescer. A local "session" ({suggestion id, caret-in-proposed}) coalesces a
+  run of keystrokes into one reviewable suggestion: typing splices into
+  `proposed`, backspace un-types pending proposed text before widening into a
+  real deletion, moving the cursor away starts a new suggestion, fully-un-typed
+  suggestions are removed. Toolbar formatting routes through the same path
+  (source tags dispatches `userEvent: 'input.format'`; rendered's TipTap
+  commands are vetoed and serialized like any edit); a multi-range change
+  becomes one discrete suggestion covering the whole span. Remote transactions
+  pass through untouched (source: not user events; rendered: guarded by the
+  `applyingRemote` flag), so sync keeps working while suggesting.
 - **Suggestion stores** (`SuggestionStore` in `suggestMode.ts`): intercepted
   edits land in a store. Editors write straight into the shared Y.Doc
   (`localStore` in `Editor.tsx`). The **suggester role is an editor locked
@@ -258,10 +266,11 @@ way), mono accents (CSS vars in `globals.css`).
   id, debounced `PUT` updates, `DELETE` on un-type — reconciling the overlay
   when the server echo arrives over the wire.
 - **Rendered-mode annotation highlights** (`annotationsPlugin` in
-  `RenderedEditor.tsx`): comment/open-suggestion ranges render as PM inline
-  decorations (md→plain→PM, the inverse of the selection mapping); fresh sets
-  are pushed via `setMeta` on every snapshot refresh and mapped through local
-  edits in between. Jumping from a floating card scrolls/selects in place in
+  `RenderedEditor.tsx`): comment ranges and open-suggestion ranges render as PM
+  inline decorations (md→plain→PM, the inverse of the selection mapping), and
+  each open suggestion also gets a proposed-text widget at its range end (or,
+  for a zero-width insertion, at the insertion point); fresh sets are pushed via
+  `setMeta` on every snapshot refresh and mapped through local edits in between. Jumping from a floating card scrolls/selects in place in
   either mode (`focusRange` prop on both editors).
 - **Remote presence** is rendered by our own code in both modes (yCollab gets
   `null` awareness — y-codemirror's built-in cursors are not used). Both
@@ -304,10 +313,14 @@ way), mono accents (CSS vars in `globals.css`).
   exotic input paths fall back to direct edits. The suggester role's
   REST-backed overlay holds plain offsets while a session is active, so
   concurrent remote edits in the same spot can shift a pending suggestion's
-  range slightly; suggester realtime typing is source-mode only (rendered
-  mode falls back to select-and-propose). The coalescing session is
-  local to one editor instance (two devices suggesting the same spot create
-  two suggestions — which is also the correct review granularity).
+  range slightly. Rendered-mode realtime suggesting recovers the edit by
+  serializing the vetoed doc to markdown and diffing — exact for prose, but it
+  inherits rendered mode's heuristic md↔plain mapping, and a vetoed edit keeps
+  the selection (rather than collapsing the caret) so the on-screen highlight
+  during a select-then-type run differs cosmetically from source mode; the
+  resulting suggestion text is the same. The coalescing session is local to one
+  editor instance (two devices suggesting the same spot create two suggestions
+  — which is also the correct review granularity).
 - `markup open` startup reconciliation: server state wins for an
   already-mapped doc; brand-new docs are seeded from the file.
 - Restoring an old version doesn't remap comment anchors created after that
@@ -332,23 +345,21 @@ way), mono accents (CSS vars in `globals.css`).
    (presence badges, per-agent tokens), plus webhooks/SSE so agents can
    subscribe to mentions, new comments, or suggestion reviews instead of
    polling.
-7. **Realtime suggesting in rendered mode** — the Suggesting toggle currently
-   covers source mode only; rendered mode needs the equivalent interception
-   at the ProseMirror transaction level.
-8. **File rename handling** — renaming a file on disk (or in the UI) should
+7. **File rename handling** — renaming a file on disk (or in the UI) should
    update the doc's name/path everywhere: manifest remapping in the CLI,
    doc_meta, the doc-list tree, and open editor topbars.
-9. **Live, intelligently grouped history** — the history panel should hot-
+8. **Live, intelligently grouped history** — the history panel should hot-
    reload as edits land in the current doc, with changes grouped into
    meaningful versions (e.g. by author + editing burst), not just the
    fixed ≥60s debounce.
-10. **History as local version preview** — selecting a version shows that
-    version of the document read-only to *just the selecting user* (no
-    diff view, no effect on other collaborators), with restore as an
-    explicit follow-up action.
+9. **History as local version preview** — selecting a version shows that
+   version of the document read-only to *just the selecting user* (no
+   diff view, no effect on other collaborators), with restore as an
+   explicit follow-up action.
 
 Shipped from the original roadmap: togglable realtime suggestion mode
-(source), in-rendered-view annotation highlights, cross-mode presence
+(both source and rendered modes), in-rendered-view annotation highlights,
+cross-mode presence
 (terminal-style remote cursors in both modes), and the **MCP server**
 (`packages/mcp-server` → `markup-mcp`, a stdio wrapper over the agent REST
 surface: read_doc, comment, suggest, accept, list_docs, …).

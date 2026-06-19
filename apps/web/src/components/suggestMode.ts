@@ -139,6 +139,51 @@ export function recordSuggestionEdit(
   return fromA;
 }
 
+/**
+ * Minimal single-region diff: the shortest span such that replacing
+ * [fromA,toA) in `before` with `insert` yields `after`. Rendered mode only
+ * sees whole-document markdown before/after a ProseMirror edit (not the
+ * per-op changes CodeMirror hands us), so it collapses that to one region.
+ */
+export function singleRegionDiff(
+  before: string,
+  after: string,
+): { fromA: number; toA: number; insert: string } {
+  let start = 0;
+  const min = Math.min(before.length, after.length);
+  while (start < min && before[start] === after[start]) start++;
+  let endBefore = before.length;
+  let endAfter = after.length;
+  while (
+    endBefore > start &&
+    endAfter > start &&
+    before[endBefore - 1] === after[endAfter - 1]
+  ) {
+    endBefore--;
+    endAfter--;
+  }
+  return { fromA: start, toA: endBefore, insert: after.slice(start, endAfter) };
+}
+
+/**
+ * Rendered-mode entry point. `proposed` is the markdown the editor *would*
+ * have produced from a (vetoed) ProseMirror edit; diff it against the current
+ * markdown and fold the change into the suggestion layer via the same
+ * coalescing logic as source mode. `backward` distinguishes backspace from
+ * delete-forward so a run of typing un-types cleanly.
+ */
+export function recordRenderedEdit(
+  store: SuggestionStore,
+  current: string,
+  session: { current: SuggestSession | null },
+  proposed: string,
+  backward: boolean,
+): void {
+  if (proposed === current) return;
+  const { fromA, toA, insert } = singleRegionDiff(current, proposed);
+  recordSuggestionEdit(store, current, session, { fromA, toA, insert, backward });
+}
+
 /** CodeMirror extension implementing the keystroke interception. */
 export function suggestModeFilter(opts: SuggestModeOptions): Extension {
   return EditorState.transactionFilter.of((tr): TransactionSpec | TransactionSpec[] => {
