@@ -142,6 +142,22 @@ function metaStoreContract(makeStore: () => Promise<MetaStore>) {
     expect(await store.getVersionContent('doc-1', versions[1].id)).toBe('v1');
     expect(await store.getVersionContent('doc-1', 9999)).toBeUndefined();
   });
+
+  it('records version attribution and names', async () => {
+    await store.create('doc-attr', 'attr.md');
+    expect(
+      await store.maybeAddVersion('doc-attr', 'hello', 0, 'Ada', 'u-1'),
+    ).toBe(true);
+    const [v] = await store.listVersions('doc-attr');
+    expect(v.author).toBe('Ada');
+    expect(v.authorId).toBe('u-1');
+    expect(v.name).toBeUndefined();
+
+    expect(await store.nameVersion('doc-attr', v.id, 'first draft')).toBe(true);
+    expect(await store.nameVersion('doc-attr', 9999, 'nope')).toBe(false);
+    const [named] = await store.listVersions('doc-attr');
+    expect(named.name).toBe('first draft');
+  });
 }
 
 describe('SqliteMetaStore', () => {

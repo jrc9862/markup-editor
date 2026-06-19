@@ -656,6 +656,19 @@ button { font-family: inherit; cursor: pointer; }
 
 .card.version .mono { font-family: var(--mono); font-size: 12.5px; }
 
+.version-meta {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 0 2px 4px;
+}
+
+.version-author {
+  font-size: 11px;
+  color: var(--accent);
+  font-family: var(--mono);
+}
+
 .diff-view {
   margin-top: 8px;
   border: 1px solid var(--border);
