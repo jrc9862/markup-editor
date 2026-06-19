@@ -20,6 +20,21 @@ export async function createDoc(req: CreateDocRequest): Promise<DocMeta> {
   return (await res.json()) as DocMeta;
 }
 
+export async function renameDoc(
+  docId: string,
+  fields: { name?: string; path?: string },
+): Promise<DocMeta> {
+  const res = await fetch(`${SERVER_HTTP}/api/docs/${docId}`, {
+    method: 'PATCH',
+    headers: headers(),
+    body: JSON.stringify(fields),
+  });
+  if (!res.ok) {
+    throw new Error(`rename failed: ${res.status} ${await res.text()}`);
+  }
+  return (await res.json()) as DocMeta;
+}
+
 export async function getDoc(docId: string): Promise<DocMeta | null> {
   const res = await fetch(`${SERVER_HTTP}/api/docs/${docId}`, {
     headers: headers(),

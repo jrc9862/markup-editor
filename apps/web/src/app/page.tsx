@@ -30,20 +30,30 @@ function buildTree(docs: DocMeta[]): TreeDir {
   return root;
 }
 
-function DirNode({ name, node }: { name: string; node: TreeDir }) {
+type RenameFn = (doc: DocMeta) => void;
+
+function DirNode({
+  name,
+  node,
+  onRename,
+}: {
+  name: string;
+  node: TreeDir;
+  onRename: RenameFn;
+}) {
   return (
     <details open className="tree-dir">
       <summary>
         <span className="tree-icon">▸</span> {name}/
       </summary>
       <div className="tree-children">
-        <TreeBody node={node} />
+        <TreeBody node={node} onRename={onRename} />
       </div>
     </details>
   );
 }
 
-function TreeBody({ node }: { node: TreeDir }) {
+function TreeBody({ node, onRename }: { node: TreeDir; onRename: RenameFn }) {
   const dirs = Array.from(node.dirs.entries()).sort(([a], [b]) =>
     a.localeCompare(b),
   );
@@ -53,17 +63,26 @@ function TreeBody({ node }: { node: TreeDir }) {
   return (
     <>
       {dirs.map(([dirName, child]) => (
-        <DirNode key={dirName} name={dirName} node={child} />
+        <DirNode key={dirName} name={dirName} node={child} onRename={onRename} />
       ))}
       {files.map((doc) => (
-        <Link key={doc.docId} className="tree-file" href={`/doc/${doc.docId}`}>
-          <span className="tree-filename">
-            {(doc.path ?? doc.name).split('/').pop()}
-          </span>
-          <span className="date">
-            {new Date(doc.updatedAt).toLocaleString()}
-          </span>
-        </Link>
+        <div key={doc.docId} className="tree-file-row">
+          <Link className="tree-file" href={`/doc/${doc.docId}`}>
+            <span className="tree-filename">
+              {(doc.path ?? doc.name).split('/').pop()}
+            </span>
+            <span className="date">
+              {new Date(doc.updatedAt).toLocaleString()}
+            </span>
+          </Link>
+          <button
+            className="tree-rename"
+            title="Rename"
+            onClick={() => onRename(doc)}
+          >
+            ✎
+          </button>
+        </div>
       ))}
     </>
   );
@@ -86,6 +105,30 @@ export default function HomePage() {
       .catch((e) => setError(String(e)));
   }, []);
 
+  const onRename = (doc: DocMeta) => {
+    const current = (doc.path ?? doc.name).split('/').pop() ?? doc.name;
+    const next = window.prompt('Rename document', current);
+    if (!next || !next.trim() || next === current) return;
+    const name = next.trim();
+    const segs = (doc.path ?? doc.name).split('/');
+    segs[segs.length - 1] = name;
+    fetch(`${SERVER_HTTP}/api/docs/${doc.docId}`, {
+      method: 'PATCH',
+      headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ name, path: segs.join('/') }),
+    })
+      .then(async (r) => {
+        if (!r.ok) return;
+        const updated = (await r.json()) as DocMeta;
+        setDocs(
+          (prev) =>
+            prev?.map((d) => (d.docId === updated.docId ? updated : d)) ?? prev,
+        );
+      })
+      .catch(() => {});
+  };
+
   return (
     <main className="doc-list">
       <div className="doc-list-header">
@@ -100,7 +143,7 @@ export default function HomePage() {
       {docs && docs.length === 0 && <p className="empty">No documents yet.</p>}
       {docs && docs.length > 0 && (
         <div className="tree">
-          <TreeBody node={buildTree(docs)} />
+          <TreeBody node={buildTree(docs)} onRename={onRename} />
         </div>
       )}
     </main>

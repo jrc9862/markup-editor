@@ -4,7 +4,7 @@ import path from 'node:path';
 import { Command } from 'commander';
 import open from 'open';
 import { applyStringToYText } from '@markup/sync-core';
-import { createDoc, getDoc } from './api.js';
+import { createDoc, getDoc, renameDoc } from './api.js';
 import { connectDoc } from './client.js';
 import { startDaemon, DISK_ORIGIN } from './daemon.js';
 import { loadManifest, saveManifest, manifestKey } from './manifest.js';
@@ -113,6 +113,35 @@ program
     console.log(`[markup] synced ${file}`);
     conn.close();
     process.exit(0);
+  });
+
+program
+  .command('mv')
+  .description('rename/move a tracked file on disk and on the server')
+  .argument('<old>', 'current path to the tracked .md file')
+  .argument('<new>', 'new path')
+  .action(async (oldFile: string, newFile: string) => {
+    const oldKey = manifestKey(oldFile);
+    const manifest = loadManifest();
+    const docId = manifest.docs[oldKey];
+    if (!docId) {
+      console.error(`[markup] not tracked: ${oldFile} (run: markup open ...)`);
+      process.exit(1);
+    }
+    const absOld = path.resolve(oldFile);
+    const absNew = path.resolve(newFile);
+    if (fs.existsSync(absOld)) {
+      fs.mkdirSync(path.dirname(absNew), { recursive: true });
+      fs.renameSync(absOld, absNew);
+    }
+    const newKey = manifestKey(newFile);
+    delete manifest.docs[oldKey];
+    manifest.docs[newKey] = docId;
+    saveManifest(manifest);
+
+    const relPath = newKey.split(path.sep).join('/');
+    await renameDoc(docId, { name: path.basename(absNew), path: relPath });
+    console.log(`[markup] moved ${oldKey} -> ${newKey}`);
   });
 
 program

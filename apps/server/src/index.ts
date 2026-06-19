@@ -249,6 +249,58 @@ app.get('/api/docs/:docId', needs('read'), docAccess('read'), async (_req, res) 
   res.json({ ...docMeta, myRole: await roleFor(meta, p, docMeta) });
 });
 
+/**
+ * Normalize a caller-supplied relative path to the manifest/tree convention:
+ * forward slashes, no leading slash, no `..` traversal. Returns null on a
+ * path that escapes the tree (the CLI writes these paths to disk).
+ */
+function cleanRelPath(p: string): string | null {
+  if (p.includes('\0')) return null;
+  const norm = p.replace(/\\/g, '/').replace(/^\/+/, '');
+  if (norm.split('/').some((seg) => seg === '..')) return null;
+  return norm;
+}
+
+/**
+ * Rename / re-path a doc (UI topbar, doc-list, or `markup mv`). Editors and
+ * above (write capability) may rename; the new path mirrors the file's
+ * location on disk so the directory-tree browser stays in sync.
+ */
+app.patch('/api/docs/:docId', needs('write'), docAccess('write'), async (req, res) => {
+  const body = req.body as { name?: string; path?: string };
+  const fields: { name?: string; path?: string } = {};
+  if (body.name !== undefined) {
+    if (typeof body.name !== 'string' || !body.name.trim()) {
+      res.status(400).json({ error: 'name must be a non-empty string' });
+      return;
+    }
+    fields.name = body.name.trim();
+  }
+  if (body.path !== undefined) {
+    if (typeof body.path !== 'string') {
+      res.status(400).json({ error: 'path must be a string' });
+      return;
+    }
+    const clean = cleanRelPath(body.path);
+    if (clean === null) {
+      res.status(400).json({ error: 'invalid path' });
+      return;
+    }
+    fields.path = clean;
+  }
+  if (fields.name === undefined && fields.path === undefined) {
+    res.status(400).json({ error: 'name or path is required' });
+    return;
+  }
+  const updated = await meta.rename(req.params.docId, fields);
+  if (!updated) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+  const p = res.locals.principal as Principal;
+  res.json({ ...updated, myRole: await roleFor(meta, p, updated) });
+});
+
 /** Snapshot: the document's current markdown as plain text. */
 app.get('/api/docs/:docId/snapshot', needs('read'), docAccess('read'), async (req, res) => {
   const conn = await hocuspocus.openDirectConnection(req.params.docId);
