@@ -22,7 +22,7 @@ export default function Toolbar({
   canAnnotate: boolean;
   /** Whether the principal's role allows creating suggestions. */
   canSuggestAction?: boolean;
-  /** Realtime suggestion mode state (source mode only for now). */
+  /** Realtime suggestion mode state (both source and rendered modes). */
   suggesting: boolean;
   suggestingAvailable: boolean;
   onSuggestingChange: (v: boolean) => void;
@@ -194,7 +194,7 @@ export default function Toolbar({
         title={
           suggestingAvailable
             ? 'Suggesting: your keystrokes become suggestions others can accept or reject'
-            : 'Suggesting mode is available in source mode'
+            : 'Suggesting mode requires edit access'
         }
       >
         <button

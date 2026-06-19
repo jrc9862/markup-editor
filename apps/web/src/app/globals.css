@@ -801,6 +801,19 @@ button { font-family: inherit; cursor: pointer; }
 .pm-annotation.suggestion {
   background: var(--suggestion-hl);
   border-bottom: 2px dashed var(--accent);
+  text-decoration: line-through;
+  text-decoration-color: var(--red);
+}
+
+/* Inline proposed text for an open suggestion (rendered mode), mirroring the
+   source-mode widget so realtime suggesting shows what you typed. */
+.pm-suggestion-proposed {
+  margin: 0 2px;
+  padding: 0 4px;
+  background: var(--green-bg);
+  border: 1px solid rgba(63, 185, 80, 0.45);
+  color: var(--green);
+  font-weight: 600;
 }
 
 /* --- Remote cursors (terminal-style blinking blocks) ------------------------ */
