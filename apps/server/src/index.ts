@@ -45,6 +45,7 @@ import {
 import { registerAuthRoutes, registerTokenRoutes } from './auth-routes.js';
 import { oidcFromEnv } from './oidc.js';
 import { docEvents, extractMentions, type DocEvent } from './events.js';
+import { redisFromEnv, localEditorStore } from './redis.js';
 import { GitBridge, isValidRef } from './git.js';
 import {
   PostgresMetaStore,
@@ -90,6 +91,11 @@ const VERSION_RETENTION: RetentionPolicy = {
   maxCount: Number(process.env.MARKUP_VERSION_RETENTION_MAX ?? 500),
   maxAgeDays: Number(process.env.MARKUP_VERSION_RETENTION_DAYS ?? 0),
 };
+// Number of trusted reverse-proxy hops in front of the server (the LB in the
+// multi-node topology). Lets Express derive the real client IP from
+// X-Forwarded-For so rate limiting keys per real client, not per proxy. Off by
+// default — only trust the header when actually behind a proxy.
+const TRUST_PROXY = Number(process.env.MARKUP_TRUST_PROXY ?? 0);
 const OIDC = oidcFromEnv(SERVER_ORIGIN);
 // Git-native flows are enabled only when the server can reach a working tree
 // (MARKUP_REPO_DIR) — the self-hosted/local shape. Otherwise the routes 404.
@@ -118,6 +124,14 @@ const persistence = pool
     })
   : new SQLite({ database: `${DATA_DIR}/markup-docs.sqlite` });
 
+// --- Cross-node layer: Redis when REDIS_URL is set, in-process otherwise ----
+//
+// Mirrors the DATABASE_URL gate. When set, the Hocuspocus Redis extension fans
+// Yjs updates + awareness across nodes, the docEvents bus is bridged onto Redis
+// pub/sub (so SSE reaches subscribers on any node), and the most-recent-editor
+// store moves into Redis. Unset ⇒ single-node behavior, unchanged.
+const redis = redisFromEnv(docEvents);
+
 // --- Hocuspocus: the Yjs sync engine + persistence -------------------------
 
 /** Best-effort attribution label for a principal (for version history). */
@@ -129,12 +143,13 @@ function principalLabel(p: Principal): { author?: string; authorId?: string } {
 
 // The most recent editor per doc, captured from authenticated connections (and
 // REST writers). Consumed when onStoreDocument snapshots a version, so history
-// carries best-effort per-author attribution. In-memory only — attribution is
-// a display nicety, not a source of truth.
-const lastEditor = new Map<string, { author?: string; authorId?: string }>();
+// carries best-effort per-author attribution. Redis-backed across nodes (the
+// storing node may differ from the editing node); in-process otherwise.
+// Attribution is a display nicety, not a source of truth.
+const editors = redis?.editors ?? localEditorStore();
 
 const hocuspocus = Hocuspocus.configure({
-  extensions: [persistence],
+  extensions: redis ? [redis.extension, persistence] : [persistence],
 
   async onAuthenticate({ token, requestHeaders, documentName, connection }) {
     // Session cookie (browser upgrade requests carry it), API token, or the
@@ -186,7 +201,7 @@ const hocuspocus = Hocuspocus.configure({
   async onChange({ documentName, context }) {
     docUpdates.inc();
     const c = context as { author?: string; authorId?: string } | undefined;
-    if (c?.author) lastEditor.set(documentName, c);
+    if (c?.author) editors.set(documentName, c);
   },
 
   async onStoreDocument({ documentName, document }) {
@@ -196,7 +211,7 @@ const hocuspocus = Hocuspocus.configure({
     // so active typing doesn't create a version per save. Stamp the snapshot
     // with the most recent editor we saw.
     const content = document.getText(CONTENT_FIELD).toString();
-    const editor = lastEditor.get(documentName);
+    const editor = await editors.get(documentName);
     const added = await meta.maybeAddVersion(
       documentName,
       content,
@@ -217,6 +232,11 @@ const hocuspocus = Hocuspocus.configure({
 // --- REST API ---------------------------------------------------------------
 
 const app = express();
+// Behind the multi-node load balancer, trust the proxy so req.ip is the real
+// client (rate limiting keys on it for anonymous/legacy principals). Only when
+// configured — trusting X-Forwarded-For unconditionally would let clients spoof
+// their IP.
+if (TRUST_PROXY > 0) app.set('trust proxy', TRUST_PROXY);
 // Structured request logging (Phase 2). Attaches the resolved principal to
 // each completed request once the /api guard sets res.locals.principal.
 app.use(
@@ -596,7 +616,7 @@ app.put('/api/docs/:docId/content', needs('write'), docAccess('write'), async (r
     applyStringToYText(doc.getText(CONTENT_FIELD), content),
   );
   // Direct (REST) writes carry no WS context, so attribute the snapshot here.
-  lastEditor.set(req.params.docId, principalLabel(res.locals.principal as Principal));
+  editors.set(req.params.docId, principalLabel(res.locals.principal as Principal));
   publish(res, req.params.docId, { type: 'content' });
   res.json({ ok: true });
 });
@@ -655,7 +675,7 @@ app.post('/api/docs/:docId/edits', needs('write'), docAccess('write'), async (re
     res.status('tooLarge' in result ? 413 : 400).json({ error: result.error });
     return;
   }
-  lastEditor.set(req.params.docId, principalLabel(res.locals.principal as Principal));
+  editors.set(req.params.docId, principalLabel(res.locals.principal as Principal));
   publish(res, req.params.docId, { type: 'content' });
   res.json(result);
 });
@@ -1227,6 +1247,7 @@ const httpServer = app.listen(PORT, () => {
     {
       port: PORT,
       storage: pool ? 'postgres' : `sqlite (${DATA_DIR})`,
+      crossNode: redis ? 'redis' : 'in-process (single node)',
       ws: `ws://localhost:${PORT}`,
       rest: `http://localhost:${PORT}/api`,
     },
@@ -1266,6 +1287,9 @@ async function shutdown(signal: string) {
   httpServer.close();
   try {
     await hocuspocus.destroy();
+    // Close our own Redis pub/sub clients (the extension closes its own in
+    // hocuspocus.destroy()). No-op on the single-node path.
+    if (redis) await redis.close();
     // meta.close() also ends the shared pg pool in the Postgres case.
     await meta.close();
   } catch (err) {
