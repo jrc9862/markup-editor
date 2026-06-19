@@ -554,14 +554,14 @@ export default function Editor({ docId }: { docId: string }) {
         // Re-read the handle when an editor (re)registers it.
         key={handleVersion}
         format={
-          canEdit || (lockedSuggest && mode === 'source')
+          canEdit || lockedSuggest
             ? (handleRef.current?.format ?? null)
             : null
         }
         canAnnotate={canAnnotate && canComment}
         canSuggestAction={canSuggest}
-        suggesting={mode === 'source' && (suggesting || lockedSuggest)}
-        suggestingAvailable={mode === 'source' && canEdit}
+        suggesting={suggesting || lockedSuggest}
+        suggestingAvailable={canEdit}
         onSuggestingChange={setSuggesting}
         onComment={() => setComposer('comment')}
         onSuggest={() => setComposer('suggest')}
@@ -593,14 +593,20 @@ export default function Editor({ docId }: { docId: string }) {
                   ytext={conn.ytext}
                   provider={conn.provider}
                   commentRanges={commentRanges}
-                  suggestionRanges={mergedSuggestions
+                  suggestionItems={mergedSuggestions
                     .filter(
                       (s) =>
                         s.status === 'open' && s.from !== null && s.to !== null,
                     )
-                    .map((s) => ({ from: s.from!, to: s.to! }))}
+                    .map((s) => ({
+                      from: s.from!,
+                      to: s.to!,
+                      proposed: s.proposed,
+                    }))}
+                  suggesting={(suggesting && canEdit) || lockedSuggest}
+                  suggestStore={lockedSuggest ? restStore : localStore}
                   focusRange={focusRange}
-                  readOnly={!canEdit}
+                  readOnly={!canEdit && !lockedSuggest}
                   onSelectionChange={setSelection}
                   onCursorChange={setCursorOffset}
                   onReady={onEditorReady}
