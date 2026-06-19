@@ -189,13 +189,28 @@ comments/suggestions; self-reported names are ignored. Web uses
 otherwise), `MARKUP_REPO_DIR` (server — enables the git-native flow routes
 against that working tree; unset = those routes 404); `MARKUP_SERVER`,
 `MARKUP_WEB` (CLI); `NEXT_PUBLIC_MARKUP_SERVER`
-(web). `NEXT_PUBLIC_*` values are inlined into the web bundle at **build
-time** — for a deployed web image they are Docker build args, not runtime env.
+(web). Phase 2 observability/limits env (all optional, sane defaults):
+`LOG_LEVEL` (default `info`), `LOG_PRETTY` (`0` forces JSON outside
+production), `MARKUP_METRICS_TOKEN` (when set, `GET /metrics` requires that
+bearer), `MARKUP_RATE_WINDOW_MS`/`MARKUP_RATE_MAX` (`/api`+`/auth` rate limit,
+per-principal else per-IP; `MARKUP_RATE_MAX=0` disables), `MARKUP_MAX_DOC_BYTES`
+(reject content-growing writes over this, default 2 MB; `0` disables),
+`MARKUP_MAX_CONNECTIONS_PER_USER` (WS cap per authenticated principal, default
+20; `0` = unlimited). `NEXT_PUBLIC_*` values are inlined into the web bundle at
+**build time** — for a deployed web image they are Docker build args, not
+runtime env.
 The web app builds with `output: 'standalone'`; its Docker image runs the
 traced server (`node apps/web/server.js`), and the server image runs
 `node apps/server/dist/index.js` with graceful SIGTERM shutdown (flushes
 `onStoreDocument` via `hocuspocus.destroy()` before exit). CI builds both
-images on every push.
+images on every push. Observability (Phase 2, `apps/server/src/{logger,
+metrics,connections,limits}.ts`): pino structured logs (`pino-http` stamps
+each request with the resolved principal), Prometheus `GET /metrics`
+(`markup_*` series: ws connections, docs loaded, update throughput,
+persistence + REST latency histograms), and a liveness/readiness split —
+`/healthz` = process up, `/readyz` = `MetaStore.ping()` ok and not shutting
+down (so the LB drains a node before its connections close; compose's `server`
+healthcheck probes it).
 
 ## Gotchas (learned the hard way)
 
@@ -348,8 +363,11 @@ way), mono accents (CSS vars in `globals.css`).
    PHASE1_IDENTITY.md), plus the role-aware web UI (Share popover, role
    badge, read-only editor below editor role with REST-backed annotations).
    Remaining: workspace membership, SAML/SCIM.
-2. **Enterprise Phase 2 (scale/ops)** — Redis multi-node, observability,
-   backups, rate limits, load testing (see ENTERPRISE_PLAN.md).
+2. **Enterprise Phase 2 (scale/ops)** — observability + self-protection
+   limits shipped (structured logs, `/metrics`, `/readyz`, REST rate limiting,
+   per-user WS caps, doc byte-size guard). Remaining: Redis multi-node (incl.
+   moving the in-process `docEvents` bus + `lastEditor` map onto Redis pub/sub),
+   backups + Yjs compaction, k6 load testing (see ENTERPRISE_PLAN.md).
 
 Shipped from the original roadmap: togglable realtime suggestion mode
 (both source and rendered modes), in-rendered-view annotation highlights,
