@@ -101,16 +101,59 @@ shared `db.test.ts` contract):
   *unnamed* versions, so any version a user cared enough to name (or the
   latest) survives indefinitely.
 
+## Slice 3 — Redis multi-node (shipped)
+
+Lets ≥2 server nodes serve the same docs so the stack is horizontally scalable
+and HA. Gated by `REDIS_URL`, mirroring the `DATABASE_URL` data-layer gate:
+unset ⇒ the single-node in-process path (unchanged); set ⇒ everything that was
+node-local moves onto Redis. New module: `apps/server/src/redis.ts`.
+
+Three things were in-process and break across nodes; all three are addressed:
+
+| What was node-local | Cross-node fix |
+|---|---|
+| **Yjs updates + awareness** | The Hocuspocus Redis extension (`@hocuspocus/extension-redis`, pinned to the 2.x line to match our server) pub/subs document updates + awareness, so an edit (or cursor) on node A reaches a client on node B. Added to the `extensions` array only when Redis is configured. |
+| **The `docEvents` SSE bus** | Bridged onto a Redis channel (`markup:docevents`). `DocEventBus` grew a transport seam: `publish()` routes to Redis when bridged, and every node — including the publisher — delivers to its *local* SSE subscribers via `deliver()` when the message comes back over the subscriber connection. One uniform path, so no de-duplication. |
+| **The `lastEditor` map** (version attribution) | Moved into Redis (`markup:lasteditor:<docId>`, 1 h TTL) so the node that runs `onStoreDocument` can read the most-recent editor even when the edit arrived on a different node. Best-effort: a Redis blip degrades to no attribution, never a failed store. |
+
+The LB topology lives in `docker-compose.scale.yml` (overlay on the base file)
++ `deploy/nginx.conf`: a `redis` service, the `server` service scaled to N
+replicas with no host port, and an `nginx` `lb` that owns `:4000` and proxies
+WebSocket + SSE + REST across the replicas (ip_hash sticky). Bring it up with:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.scale.yml \
+  --profile app up -d --build --scale server=2
+```
+
+### Env (all optional)
+
+| Var | Default | Effect |
+|---|---|---|
+| `REDIS_URL` | unset | when set, enables the cross-node layer (Yjs fan-out + SSE bridge + attribution store) |
+| `MARKUP_TRUST_PROXY` | `0` | trusted reverse-proxy hop count; `>0` makes Express derive the real client IP from `X-Forwarded-For` (so rate limiting keys per client behind the LB, not per proxy) |
+
+### Deliberate decisions
+
+- **Connection cap stays per-node.** `connections.ts` remains in-process: under
+  Redis it becomes a per-node WS cap, which is still a useful self-protection
+  guard. Cross-node accounting would cost a Redis round-trip on every connect
+  for little benefit; deferred.
+- **Readiness does not ping Redis.** `/readyz` checks only the metadata store.
+  A node with Redis briefly unreachable can still serve its locally-loaded docs
+  (degraded cross-node sync); failing readiness would drain *every* node on a
+  Redis blip and turn a partial degradation into a full outage. Redis health is
+  an alerting concern, not a per-node readiness gate.
+- **REST reads are eventually consistent across nodes.** `openDirectConnection`
+  loads the doc on the handling node and the Redis extension syncs it from
+  peers; a read issued microseconds after a write on another node can momentarily
+  miss it. Acceptable for the agent/REST surface; the WS path is the realtime one.
+- **`!reset` on the server's `ports`** (needs Compose ≥ 2.24) drops the base
+  file's `4000:4000` so replicas don't collide — nginx owns the public port.
+
 ## Remaining Phase 2 slices
 
-1. **Redis multi-node.** Hocuspocus Redis extension (gated by `REDIS_URL`,
-   mirroring the `DATABASE_URL` pattern) for cross-node Yjs update + awareness
-   fan-out. **Critical coupling:** the in-process `docEvents` bus *and* the
-   `lastEditor` map (both in `apps/server/src/index.ts` / `events.ts`) must
-   also move onto Redis pub/sub, or SSE delivery and version attribution break
-   for connections served by a different node. Compose gains a `redis` service
-   and a second server node behind a WS-aware load balancer.
-2. **Load testing.** k6 WebSocket + REST scripts at ~2× expected peak, wired
+1. **Load testing.** k6 WebSocket + REST scripts at ~2× expected peak, wired
    into a manual CI workflow.
 
 ## Backups (runbook)

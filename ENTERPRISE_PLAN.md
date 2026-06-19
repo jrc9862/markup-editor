@@ -123,7 +123,16 @@ by an enterprise today.
      (upsert, not an append-only update log), so there is no update log to
      squash — "Yjs update compaction" above is moot under the current
      extension and was dropped as a deliberate non-goal.
-   - Remaining: Redis multi-node (incl. moving the in-process `docEvents` bus
-     and `lastEditor` map onto Redis pub/sub), k6 load testing.
+   - **Slice 3 — Redis multi-node (shipped; see PHASE2_OPS.md).** Hocuspocus
+     Redis extension (gated by `REDIS_URL`, mirroring `DATABASE_URL`) for
+     cross-node Yjs update + awareness fan-out, plus the two in-process pieces
+     that would otherwise break across nodes: the `docEvents` SSE bus (bridged
+     onto a Redis channel via a transport seam on `DocEventBus`) and the
+     `lastEditor` version-attribution map (moved into Redis with a TTL). LB
+     topology in `docker-compose.scale.yml` + `deploy/nginx.conf` (a `redis`
+     service, scaled `server` replicas with no host port, and a WS-aware nginx
+     `lb` owning `:4000`); `MARKUP_TRUST_PROXY` for correct client IPs behind
+     the LB. The per-user WS connection cap stays in-process (a per-node guard).
+   - Remaining: k6 load testing.
 4. **Phase 3 (enterprise polish)**: SAML/SCIM, audit log export, admin
    console, retention policies, compliance paperwork.

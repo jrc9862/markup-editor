@@ -39,14 +39,32 @@ export interface DocEvent {
   text?: string;
 }
 
-class DocEventBus extends EventEmitter {
+export class DocEventBus extends EventEmitter {
+  // When set (multi-node, see redis.ts), publish() routes through this
+  // transport instead of delivering locally. The transport fans the event out
+  // to every node over Redis pub/sub, and each node — including this one —
+  // delivers to its local SSE subscribers via deliver() when the message comes
+  // back. One uniform path, so no de-duplication is needed.
+  private transport?: (e: DocEvent) => void;
+
   constructor() {
     super();
     // Many concurrent SSE subscribers per doc are expected.
     this.setMaxListeners(0);
   }
 
+  /** Install (or clear, with `undefined`) the cross-node transport. */
+  setTransport(fn: ((e: DocEvent) => void) | undefined): void {
+    this.transport = fn;
+  }
+
   publish(event: DocEvent): void {
+    if (this.transport) this.transport(event);
+    else this.deliver(event);
+  }
+
+  /** Fan an event out to this node's local SSE subscribers. */
+  deliver(event: DocEvent): void {
     this.emit(event.docId, event);
   }
 
