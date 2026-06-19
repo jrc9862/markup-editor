@@ -34,6 +34,7 @@ import RenderedEditor from './RenderedEditor';
 import Toolbar from './Toolbar';
 import FloatingAnnotations from './FloatingAnnotations';
 import HistoryPanel from './HistoryPanel';
+import FindReplacePanel from './FindReplacePanel';
 import type { EditorHandle } from './format';
 import type { SuggestionStore } from './suggestMode';
 
@@ -117,6 +118,7 @@ export default function Editor({ docId }: { docId: string }) {
   const [selection, setSelection] = useState<Range | null>(null);
   const [composer, setComposer] = useState<'comment' | 'suggest' | null>(null);
   const [showHistory, setShowHistory] = useState(false);
+  const [showFind, setShowFind] = useState(false);
   // Local-only read-only preview of a past version (roadmap #9): visible to
   // just this user, no diff, no effect on other collaborators.
   const [preview, setPreview] = useState<{
@@ -584,6 +586,16 @@ export default function Editor({ docId }: { docId: string }) {
           ⏱ History
         </button>
 
+        {canEdit && (
+          <button
+            className={`ghost-btn history-toggle ${showFind ? 'on' : ''}`}
+            title="Find & replace"
+            onClick={() => setShowFind((v) => !v)}
+          >
+            ⇄ Replace
+          </button>
+        )}
+
         {!canEdit && <span className="role-badge">{myRole}</span>}
         <SharePanel docId={docId} isOwner={myRole === 'owner'} onCopyLink={copyLink} />
       </header>
@@ -604,6 +616,10 @@ export default function Editor({ docId }: { docId: string }) {
         onComment={() => setComposer('comment')}
         onSuggest={() => setComposer('suggest')}
       />
+
+      {showFind && conn && canEdit && (
+        <FindReplacePanel ytext={conn.ytext} onClose={() => setShowFind(false)} />
+      )}
 
       <div className="workspace">
         <main className="page-area">

@@ -9,6 +9,9 @@ import { v4 as uuidv4 } from 'uuid';
 import type * as Y from 'yjs';
 import {
   applyStringToYText,
+  applyEdits,
+  findReplaceEdits,
+  type RangeEdit,
   CONTENT_FIELD,
   addComment,
   addReply,
@@ -403,6 +406,61 @@ app.put('/api/docs/:docId/content', needs('write'), docAccess('write'), async (r
   // Direct (REST) writes carry no WS context, so attribute the snapshot here.
   lastEditor.set(req.params.docId, principalLabel(res.locals.principal as Principal));
   res.json({ ok: true });
+});
+
+/**
+ * Multi-edits (roadmap #1): batch find/replace or an explicit list of range
+ * replacements applied as ONE transaction — one undoable step that still
+ * merges cleanly with concurrent peers. Body is either:
+ *   { find, replace, regex?, caseSensitive? }   — find/replace across the doc
+ *   { edits: [{ from, to, insert }, ...] }       — explicit ranges
+ */
+app.post('/api/docs/:docId/edits', needs('write'), docAccess('write'), async (req, res) => {
+  const body = req.body as {
+    find?: string;
+    replace?: string;
+    regex?: boolean;
+    caseSensitive?: boolean;
+    edits?: RangeEdit[];
+  };
+  const hasFind = typeof body.find === 'string';
+  const hasEdits = Array.isArray(body.edits);
+  if (hasFind === hasEdits) {
+    res.status(400).json({ error: 'provide exactly one of {find,replace} or {edits}' });
+    return;
+  }
+  if (hasEdits) {
+    for (const e of body.edits!) {
+      if (
+        typeof e?.from !== 'number' ||
+        typeof e?.to !== 'number' ||
+        typeof e?.insert !== 'string'
+      ) {
+        res.status(400).json({ error: 'each edit needs from, to, insert' });
+        return;
+      }
+    }
+  }
+  const result = await withDoc(req.params.docId, (doc) => {
+    const ytext = doc.getText(CONTENT_FIELD);
+    const edits = hasEdits
+      ? body.edits!
+      : findReplaceEdits(ytext.toString(), body.find!, body.replace ?? '', {
+          regex: body.regex,
+          caseSensitive: body.caseSensitive,
+        });
+    try {
+      return { applied: applyEdits(ytext, edits) };
+    } catch (err) {
+      return { error: err instanceof Error ? err.message : 'invalid edits' };
+    }
+  });
+  if ('error' in result) {
+    res.status(400).json(result);
+    return;
+  }
+  lastEditor.set(req.params.docId, principalLabel(res.locals.principal as Principal));
+  res.json(result);
 });
 
 app.get('/api/docs/:docId/comments', needs('read'), docAccess('read'), async (req, res) => {
