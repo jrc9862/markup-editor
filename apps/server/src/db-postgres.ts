@@ -475,6 +475,10 @@ export class PostgresMetaStore implements MetaStore {
     );
   }
 
+  async ping(): Promise<void> {
+    await this.pool.query('SELECT 1');
+  }
+
   async close(): Promise<void> {
     await this.pool.end();
   }

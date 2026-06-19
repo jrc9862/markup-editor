@@ -158,6 +158,10 @@ function metaStoreContract(makeStore: () => Promise<MetaStore>) {
     const [named] = await store.listVersions('doc-attr');
     expect(named.name).toBe('first draft');
   });
+
+  it('ping resolves while the store is reachable', async () => {
+    await expect(store.ping()).resolves.toBeUndefined();
+  });
 }
 
 describe('SqliteMetaStore', () => {
