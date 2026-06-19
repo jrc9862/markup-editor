@@ -35,6 +35,8 @@ import Toolbar from './Toolbar';
 import FloatingAnnotations from './FloatingAnnotations';
 import HistoryPanel from './HistoryPanel';
 import FindReplacePanel from './FindReplacePanel';
+import GitPanel from './GitPanel';
+import ReviewPanel from './ReviewPanel';
 import type { EditorHandle } from './format';
 import type { SuggestionStore } from './suggestMode';
 
@@ -119,6 +121,8 @@ export default function Editor({ docId }: { docId: string }) {
   const [composer, setComposer] = useState<'comment' | 'suggest' | null>(null);
   const [showHistory, setShowHistory] = useState(false);
   const [showFind, setShowFind] = useState(false);
+  const [showGit, setShowGit] = useState(false);
+  const [showReview, setShowReview] = useState(false);
   // Local-only read-only preview of a past version (roadmap #9): visible to
   // just this user, no diff, no effect on other collaborators.
   const [preview, setPreview] = useState<{
@@ -599,6 +603,26 @@ export default function Editor({ docId }: { docId: string }) {
           </button>
         )}
 
+        {canEdit && (
+          <button
+            className={`ghost-btn history-toggle ${showReview ? 'on' : ''}`}
+            title="Review suggestions"
+            onClick={() => setShowReview((v) => !v)}
+          >
+            ✓ Review
+          </button>
+        )}
+
+        {canEdit && (
+          <button
+            className={`ghost-btn history-toggle ${showGit ? 'on' : ''}`}
+            title="Git"
+            onClick={() => setShowGit((v) => !v)}
+          >
+            ⎇ Git
+          </button>
+        )}
+
         {!canEdit && <span className="role-badge">{myRole}</span>}
         <SharePanel docId={docId} isOwner={myRole === 'owner'} onCopyLink={copyLink} />
       </header>
@@ -752,6 +776,17 @@ export default function Editor({ docId }: { docId: string }) {
             }}
           />
         )}
+
+        {showReview && conn && (
+          <ReviewPanel
+            docId={docId}
+            open={mergedSuggestions.filter((s) => s.status === 'open')}
+            onClose={() => setShowReview(false)}
+            onApplied={() => {}}
+          />
+        )}
+
+        {showGit && conn && <GitPanel onClose={() => setShowGit(false)} />}
       </div>
     </div>
   );

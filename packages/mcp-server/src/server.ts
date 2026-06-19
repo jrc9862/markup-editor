@@ -366,6 +366,61 @@ export function createMcpServer(
     (a) => run(() => client.multiEdit(a.docId, { edits: a.edits })),
   );
 
+  server.registerTool(
+    'review_suggestions',
+    {
+      title: 'Batch-review suggestions',
+      description:
+        'Accept and/or reject a set of open suggestions in one atomic review. Requires write capability.',
+      inputSchema: {
+        ...docId,
+        accept: z.array(z.string()).optional().describe('Suggestion ids to accept.'),
+        reject: z.array(z.string()).optional().describe('Suggestion ids to reject.'),
+      },
+    },
+    (a) => run(() => client.reviewSuggestions(a.docId, a.accept ?? [], a.reject ?? [])),
+  );
+
+  // --- Git-native flows -------------------------------------------------------
+
+  server.registerTool(
+    'git_status',
+    {
+      title: 'Git status',
+      description:
+        'Current branch and working-tree status (enabled only when the server has a repo: MARKUP_REPO_DIR).',
+      inputSchema: {},
+    },
+    () => run(() => client.gitStatus()),
+  );
+
+  server.registerTool(
+    'git_commit',
+    {
+      title: 'Git commit',
+      description:
+        'Stage and commit the .md files (all changes, or just `paths`). Requires write capability.',
+      inputSchema: {
+        message: z.string().describe('Commit message.'),
+        paths: z.array(z.string()).optional().describe('Specific paths to commit.'),
+      },
+    },
+    (a) => run(() => client.gitCommit(a.message, a.paths)),
+  );
+
+  server.registerTool(
+    'git_branch',
+    {
+      title: 'Git branch',
+      description: 'Create a branch (and check it out by default). Requires write capability.',
+      inputSchema: {
+        name: z.string().describe('New branch name.'),
+        checkout: z.boolean().optional().describe('Check it out (default true).'),
+      },
+    },
+    (a) => run(() => client.gitBranch(a.name, a.checkout ?? true)),
+  );
+
   // --- Events -----------------------------------------------------------------
 
   server.registerTool(
@@ -427,8 +482,12 @@ export const TOOL_NAMES = [
   'accept_suggestion',
   'reject_suggestion',
   'reply_suggestion',
+  'review_suggestions',
   'find_replace',
   'multi_edit',
   'watch_events',
+  'git_status',
+  'git_commit',
+  'git_branch',
   'list_versions',
 ] as const;

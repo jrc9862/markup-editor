@@ -859,6 +859,57 @@ button { font-family: inherit; cursor: pointer; }
   font-family: var(--mono);
 }
 
+/* --- Git panel ----------------------------------------------------------------- */
+
+.git-branch { font-size: 12px; color: var(--muted); padding: 4px 2px; }
+
+.git-files { margin: 6px 0; }
+
+.git-file {
+  display: flex;
+  gap: 8px;
+  font-size: 12px;
+  padding: 2px 2px;
+}
+
+.git-stat { color: var(--accent); min-width: 18px; }
+.git-path { word-break: break-all; }
+
+.git-branches { margin-top: 10px; display: flex; flex-direction: column; gap: 4px; }
+
+.git-branch-row { display: flex; gap: 6px; }
+
+.git-branch-item {
+  text-align: left;
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 4px 8px;
+  cursor: pointer;
+}
+
+.git-branch-item.on { color: var(--accent); border-color: var(--accent); cursor: default; }
+.git-branch-item:hover:not(.on) { background: var(--surface-hover); }
+
+/* --- Review panel -------------------------------------------------------------- */
+
+.review-bulk { display: flex; gap: 6px; margin-bottom: 8px; }
+
+.review-item { display: flex; flex-direction: column; gap: 6px; }
+
+.review-author { font-size: 11px; color: var(--accent); }
+
+.review-diff { font-size: 12.5px; display: flex; flex-direction: column; gap: 2px; }
+.review-diff del { color: var(--red); text-decoration: line-through; }
+.review-diff ins { color: var(--green); text-decoration: none; }
+
+.review-actions { display: flex; gap: 6px; }
+
+.pick-accept { color: var(--green); border-color: var(--green); }
+.pick-reject { color: var(--red); border-color: var(--red); }
+
 /* --- Doc list (home) ----------------------------------------------------------- */
 
 .doc-list {

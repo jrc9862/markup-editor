@@ -158,6 +158,25 @@ export class MarkupClient {
     return this.json('POST', `/api/docs/${docId}/edits`, body);
   }
 
+  /** PR-style batch review: accept and/or reject open suggestions atomically. */
+  reviewSuggestions(docId: string, accept: string[], reject: string[]) {
+    return this.json('POST', `/api/docs/${docId}/suggestions/review`, {
+      accept,
+      reject,
+    });
+  }
+
+  // --- Git-native flows ------------------------------------------------------
+  gitStatus() {
+    return this.json('GET', '/api/git/status');
+  }
+  gitCommit(message: string, paths?: string[]) {
+    return this.json('POST', '/api/git/commit', { message, paths });
+  }
+  gitBranch(name: string, checkout = true) {
+    return this.json('POST', '/api/git/branch', { name, checkout });
+  }
+
   // --- History ---------------------------------------------------------------
   listVersions(docId: string) {
     return this.json('GET', `/api/docs/${docId}/versions`);
