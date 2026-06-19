@@ -211,9 +211,12 @@ export default function Editor({ docId }: { docId: string }) {
   // Once the signed-in identity is known, presence uses the real name
   // (the provider starts with the guest name before /api/me resolves).
   useEffect(() => {
-    if (!conn || me?.kind !== 'user') return;
-    if (conn.user.name === me.user!.name) return;
-    const user = makePresence(me.user!.name);
+    if (!conn || !me?.user) return;
+    if (conn.user.name === me.user.name) return;
+    const user = makePresence(
+      me.user.name,
+      me.kind === 'agent' ? 'agent' : 'human',
+    );
     conn.provider.setAwarenessField('user', user);
     setConn({ ...conn, user });
   }, [me, conn]);
@@ -544,11 +547,11 @@ export default function Editor({ docId }: { docId: string }) {
           {peers.map((p, i) => (
             <span
               key={i}
-              className="avatar"
+              className={`avatar ${p.kind === 'agent' ? 'agent' : ''}`}
               style={{ background: p.color }}
-              title={p.name}
+              title={p.kind === 'agent' ? `${p.name} (agent)` : p.name}
             >
-              {p.name.slice(0, 2).toUpperCase()}
+              {p.kind === 'agent' ? '🤖' : p.name.slice(0, 2).toUpperCase()}
             </span>
           ))}
           {conn && !signedIn && (

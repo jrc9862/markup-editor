@@ -15,6 +15,9 @@ export function colorForSeed(seed: string): string {
 }
 
 /** Build a presence identity from a display name. */
-export function makePresence(name: string): PresenceUser {
-  return { name, color: colorForSeed(name) };
+export function makePresence(
+  name: string,
+  kind: 'human' | 'agent' = 'human',
+): PresenceUser {
+  return { name, color: colorForSeed(name), kind };
 }
