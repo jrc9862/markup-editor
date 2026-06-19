@@ -104,5 +104,16 @@ by an enterprise today.
    server-side enforcement, attribution.
 3. **Phase 2 (scale/ops)**: Redis multi-node, observability, backups, rate
    limits, load testing.
+   - **Slice 1 — observability + limits (shipped).** Structured logging
+     (pino/pino-http with per-request principal attribution), Prometheus
+     `/metrics` (ws connections, docs loaded, update throughput, persistence
+     + REST latency), liveness `/healthz` vs readiness `/readyz`
+     (`MetaStore.ping()`, fails during graceful shutdown so the LB drains
+     first), REST rate limiting (`express-rate-limit`, per-principal/per-IP),
+     per-user WebSocket connection caps, and a document byte-size guard on the
+     content-growing routes. All env-tunable, no new infra.
+   - Remaining: Redis multi-node (incl. moving the in-process `docEvents` bus
+     and `lastEditor` map onto Redis pub/sub), backups + Yjs compaction, k6
+     load testing.
 4. **Phase 3 (enterprise polish)**: SAML/SCIM, audit log export, admin
    console, retention policies, compliance paperwork.
