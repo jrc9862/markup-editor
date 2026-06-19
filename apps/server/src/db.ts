@@ -14,6 +14,25 @@ export interface SessionRow {
   expiresAt: string;
 }
 
+/**
+ * Edit-history retention policy (Phase 2). `doc_versions` is the one
+ * genuinely unbounded growth vector in this storage model (a full-content
+ * snapshot is appended every ~60s of active editing), so it gets a retention
+ * cap. Both limits are independently disable-able; user-named versions and
+ * the single most-recent version are always kept.
+ */
+export interface RetentionPolicy {
+  /** Keep at most this many versions per doc (newest wins); `<=0` disables. */
+  maxCount: number;
+  /** Drop versions older than this many days; `<=0` disables. */
+  maxAgeDays: number;
+}
+
+/** A retention policy that prunes nothing — used to short-circuit when both caps are off. */
+export function retentionDisabled(p: RetentionPolicy): boolean {
+  return p.maxCount <= 0 && p.maxAgeDays <= 0;
+}
+
 export interface ApiTokenRow {
   id: string;
   userId: string;
@@ -67,6 +86,15 @@ export interface MetaStore {
     versionId: number,
     name: string,
   ): Promise<boolean>;
+  /**
+   * Enforce the retention policy for one doc's version history. Never deletes
+   * a user-named version or the single most-recent version. Returns the
+   * number of versions pruned.
+   */
+  pruneVersions(docId: string, policy: RetentionPolicy): Promise<number>;
+  /** Apply `pruneVersions` across every doc (a startup sweep so the age cap
+   * also reaches docs that are no longer being edited). Returns total pruned. */
+  pruneAllVersions(policy: RetentionPolicy): Promise<number>;
 
   // --- Identity (Phase 1). Sessions and API tokens store sha256 hashes only.
   /** Insert by email, or refresh the name on an existing user. */
@@ -336,6 +364,40 @@ export class SqliteMetaStore implements MetaStore {
       .prepare('SELECT content FROM doc_versions WHERE doc_id = ? AND id = ?')
       .get(docId, versionId) as { content: string } | undefined;
     return row?.content;
+  }
+
+  async pruneVersions(docId: string, policy: RetentionPolicy): Promise<number> {
+    if (retentionDisabled(policy)) return 0;
+    const ageCutoff =
+      policy.maxAgeDays > 0
+        ? new Date(Date.now() - policy.maxAgeDays * 86_400_000).toISOString()
+        : null;
+    // Delete unnamed versions that breach either cap, but never the single
+    // most-recent version (so a doc always keeps one restorable point).
+    const res = this.db
+      .prepare(
+        `DELETE FROM doc_versions
+         WHERE doc_id = @doc
+           AND name IS NULL
+           AND id <> (SELECT id FROM doc_versions WHERE doc_id = @doc ORDER BY id DESC LIMIT 1)
+           AND (
+                 (@maxCount > 0 AND id NOT IN (
+                    SELECT id FROM doc_versions WHERE doc_id = @doc ORDER BY id DESC LIMIT @maxCount))
+              OR (@ageCutoff IS NOT NULL AND created_at < @ageCutoff)
+           )`,
+      )
+      .run({ doc: docId, maxCount: policy.maxCount, ageCutoff });
+    return res.changes;
+  }
+
+  async pruneAllVersions(policy: RetentionPolicy): Promise<number> {
+    if (retentionDisabled(policy)) return 0;
+    const docs = this.db
+      .prepare('SELECT DISTINCT doc_id FROM doc_versions')
+      .all() as Array<{ doc_id: string }>;
+    let total = 0;
+    for (const d of docs) total += await this.pruneVersions(d.doc_id, policy);
+    return total;
   }
 
   // --- Identity -------------------------------------------------------------

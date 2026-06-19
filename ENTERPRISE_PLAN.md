@@ -40,9 +40,11 @@ by an enterprise today.
   interface, so the Yjs-update persistence swap is contained; `MetaStore` is
   one file. Keep the additive-migration discipline but move to a real
   migration tool (e.g. drizzle/knex migrations).
-- **Yjs update compaction**: the update log grows unboundedly per doc; add
-  periodic squash-to-snapshot (encode state vector, discard history older
-  than N days) or hot docs get slow to load.
+- ~~**Yjs update compaction**~~ (N/A under the current persistence model):
+  this assumed an append-only update log, but the Hocuspocus
+  `Database`/`SQLite` extensions store a single merged, GC'd snapshot per doc
+  (upsert under `UNIQUE(name)`). There is no history to squash; the real
+  unbounded vector is `doc_versions`, handled by Phase 2 slice 2 retention.
 - **Backups + PITR**, encryption at rest.
 - **Document size limit** — a 10 MB markdown file through diff-match-patch
   on every keystroke is a DoS on ourselves.
@@ -113,8 +115,15 @@ by an enterprise today.
      first), REST rate limiting (`express-rate-limit`, per-principal/per-IP),
      per-user WebSocket connection caps, and a document byte-size guard on the
      content-growing routes. All env-tunable, no new infra.
+   - **Slice 2 — backups + history retention (shipped; see PHASE2_OPS.md).**
+     `doc_versions` retention caps (per-doc count + age, sparing user-named and
+     latest snapshots; pruned on write and via a startup sweep) and
+     `scripts/backup.sh` (pg_dump / SQLite online `.backup`, PITR runbook).
+     Note: the persistence model stores a single GC'd Yjs snapshot per doc
+     (upsert, not an append-only update log), so there is no update log to
+     squash — "Yjs update compaction" above is moot under the current
+     extension and was dropped as a deliberate non-goal.
    - Remaining: Redis multi-node (incl. moving the in-process `docEvents` bus
-     and `lastEditor` map onto Redis pub/sub), backups + Yjs compaction, k6
-     load testing.
+     and `lastEditor` map onto Redis pub/sub), k6 load testing.
 4. **Phase 3 (enterprise polish)**: SAML/SCIM, audit log export, admin
    console, retention policies, compliance paperwork.
