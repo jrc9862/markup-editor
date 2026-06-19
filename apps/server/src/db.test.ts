@@ -159,6 +159,73 @@ function metaStoreContract(makeStore: () => Promise<MetaStore>) {
     expect(named.name).toBe('first draft');
   });
 
+  it('prunes version history to the count cap, keeping the newest', async () => {
+    await store.create('doc-ret', 'ret.md');
+    for (const c of ['a', 'b', 'c', 'd', 'e']) {
+      expect(await store.maybeAddVersion('doc-ret', c, 0)).toBe(true);
+    }
+    // 5 versions, keep the newest 3 → 2 pruned.
+    expect(
+      await store.pruneVersions('doc-ret', { maxCount: 3, maxAgeDays: 0 }),
+    ).toBe(2);
+    const left = await store.listVersions('doc-ret');
+    expect(left).toHaveLength(3);
+    expect(await store.getVersionContent('doc-ret', left[0].id)).toBe('e');
+    expect(await store.getVersionContent('doc-ret', left[2].id)).toBe('c');
+    // Idempotent: a second prune at the same cap removes nothing.
+    expect(
+      await store.pruneVersions('doc-ret', { maxCount: 3, maxAgeDays: 0 }),
+    ).toBe(0);
+  });
+
+  it('never prunes named versions or the single most-recent version', async () => {
+    await store.create('doc-ret2', 'ret2.md');
+    for (const c of ['x', 'y', 'z'] /* oldest → newest */) {
+      expect(await store.maybeAddVersion('doc-ret2', c, 0)).toBe(true);
+    }
+    const all = await store.listVersions('doc-ret2'); // z, y, x
+    const oldest = all[2];
+    expect(await store.nameVersion('doc-ret2', oldest.id, 'pinned')).toBe(true);
+
+    // maxCount=1 would keep only the newest, but the named oldest is exempt,
+    // so only the unnamed middle version is dropped.
+    expect(
+      await store.pruneVersions('doc-ret2', { maxCount: 1, maxAgeDays: 0 }),
+    ).toBe(1);
+    const left = await store.listVersions('doc-ret2');
+    expect(left.map((v) => v.id)).toEqual([all[0].id, oldest.id]); // z, pinned x
+  });
+
+  it('does not prune fresh versions under an age cap, and no-ops when disabled', async () => {
+    await store.create('doc-ret3', 'ret3.md');
+    for (const c of ['1', '2', '3']) {
+      await store.maybeAddVersion('doc-ret3', c, 0);
+    }
+    // Just-written versions are far younger than 30 days.
+    expect(
+      await store.pruneVersions('doc-ret3', { maxCount: 0, maxAgeDays: 30 }),
+    ).toBe(0);
+    // Both caps off → never touches anything.
+    expect(
+      await store.pruneVersions('doc-ret3', { maxCount: 0, maxAgeDays: 0 }),
+    ).toBe(0);
+    expect(await store.listVersions('doc-ret3')).toHaveLength(3);
+  });
+
+  it('sweeps every doc with pruneAllVersions', async () => {
+    await store.create('doc-sweep-a', 'a.md');
+    await store.create('doc-sweep-b', 'b.md');
+    for (const c of ['p', 'q', 'r']) {
+      await store.maybeAddVersion('doc-sweep-a', c, 0);
+      await store.maybeAddVersion('doc-sweep-b', c, 0);
+    }
+    // Keep newest 1 per doc → 2 pruned from each of the two docs.
+    const total = await store.pruneAllVersions({ maxCount: 1, maxAgeDays: 0 });
+    expect(total).toBeGreaterThanOrEqual(4);
+    expect(await store.listVersions('doc-sweep-a')).toHaveLength(1);
+    expect(await store.listVersions('doc-sweep-b')).toHaveLength(1);
+  });
+
   it('ping resolves while the store is reachable', async () => {
     await expect(store.ping()).resolves.toBeUndefined();
   });

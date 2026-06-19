@@ -29,7 +29,11 @@ import {
   snapshotSuggestions,
 } from '@markup/sync-core';
 import type { CreateDocRequest, DocMeta, TokenScope } from '@markup/sync-core';
-import { SqliteMetaStore, type MetaStore } from './db.js';
+import {
+  SqliteMetaStore,
+  type MetaStore,
+  type RetentionPolicy,
+} from './db.js';
 import {
   effectiveScope,
   isRole,
@@ -55,6 +59,7 @@ import {
   docUpdates,
   persistDuration,
   httpDuration,
+  versionsPruned,
 } from './metrics.js';
 import { connections } from './connections.js';
 import { exceedsByteLimit, applyRangeEditsToString } from './limits.js';
@@ -78,6 +83,13 @@ const MAX_CONN_PER_USER = Number(
 const RATE_WINDOW_MS = Number(process.env.MARKUP_RATE_WINDOW_MS ?? 60_000);
 const RATE_MAX = Number(process.env.MARKUP_RATE_MAX ?? 600);
 const METRICS_TOKEN = process.env.MARKUP_METRICS_TOKEN;
+// Edit-history retention (Phase 2). doc_versions is the one unbounded growth
+// vector; cap it per doc. Named versions and the latest snapshot always
+// survive. 0 disables either cap.
+const VERSION_RETENTION: RetentionPolicy = {
+  maxCount: Number(process.env.MARKUP_VERSION_RETENTION_MAX ?? 500),
+  maxAgeDays: Number(process.env.MARKUP_VERSION_RETENTION_DAYS ?? 0),
+};
 const OIDC = oidcFromEnv(SERVER_ORIGIN);
 // Git-native flows are enabled only when the server can reach a working tree
 // (MARKUP_REPO_DIR) — the self-hosted/local shape. Otherwise the routes 404.
@@ -185,13 +197,19 @@ const hocuspocus = Hocuspocus.configure({
     // with the most recent editor we saw.
     const content = document.getText(CONTENT_FIELD).toString();
     const editor = lastEditor.get(documentName);
-    await meta.maybeAddVersion(
+    const added = await meta.maybeAddVersion(
       documentName,
       content,
       undefined,
       editor?.author,
       editor?.authorId,
     );
+    // Only prune when we actually grew the history — keeps the policy out of
+    // the hot path for no-op stores.
+    if (added) {
+      const pruned = await meta.pruneVersions(documentName, VERSION_RETENTION);
+      if (pruned) versionsPruned.inc(pruned);
+    }
     done();
   },
 });
@@ -1215,6 +1233,21 @@ const httpServer = app.listen(PORT, () => {
     'markup server listening',
   );
 });
+
+// One-shot retention sweep at startup so the age cap reaches docs that are no
+// longer being edited (the per-store prune only fires on the next snapshot).
+// Fire-and-forget: never block serving on it.
+void (async () => {
+  try {
+    const pruned = await meta.pruneAllVersions(VERSION_RETENTION);
+    if (pruned) {
+      versionsPruned.inc(pruned);
+      logger.info({ pruned }, 'retention sweep: pruned old versions');
+    }
+  } catch (err) {
+    logger.error({ err }, 'retention sweep failed');
+  }
+})();
 
 const wss = new WebSocketServer({ noServer: true });
 httpServer.on('upgrade', (request, socket, head) => {
