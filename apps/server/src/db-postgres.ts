@@ -194,6 +194,32 @@ export class PostgresMetaStore implements MetaStore {
     ]);
   }
 
+  async rename(
+    docId: string,
+    fields: { name?: string; path?: string },
+  ): Promise<DocMeta | undefined> {
+    const sets: string[] = [];
+    const vals: unknown[] = [];
+    if (fields.name !== undefined) {
+      vals.push(fields.name);
+      sets.push(`name = $${vals.length}`);
+    }
+    if (fields.path !== undefined) {
+      vals.push(fields.path);
+      sets.push(`path = $${vals.length}`);
+    }
+    if (sets.length) {
+      vals.push(new Date().toISOString());
+      sets.push(`updated_at = $${vals.length}`);
+      vals.push(docId);
+      await this.pool.query(
+        `UPDATE doc_meta SET ${sets.join(', ')} WHERE doc_id = $${vals.length}`,
+        vals,
+      );
+    }
+    return this.get(docId);
+  }
+
   async maybeAddVersion(
     docId: string,
     content: string,

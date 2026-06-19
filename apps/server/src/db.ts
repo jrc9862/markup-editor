@@ -39,6 +39,11 @@ export interface MetaStore {
   get(docId: string): Promise<DocMeta | undefined>;
   list(): Promise<DocMeta[]>;
   touch(docId: string): Promise<void>;
+  /** Rename / re-path a doc; returns the updated meta (undefined if gone). */
+  rename(
+    docId: string,
+    fields: { name?: string; path?: string },
+  ): Promise<DocMeta | undefined>;
   /**
    * Record a version snapshot unless the content is unchanged from the
    * latest one, or the latest one is younger than `minIntervalMs` (so a
@@ -209,6 +214,31 @@ export class SqliteMetaStore implements MetaStore {
     this.db
       .prepare('UPDATE doc_meta SET updated_at = ? WHERE doc_id = ?')
       .run(new Date().toISOString(), docId);
+  }
+
+  async rename(
+    docId: string,
+    fields: { name?: string; path?: string },
+  ): Promise<DocMeta | undefined> {
+    const sets: string[] = [];
+    const vals: unknown[] = [];
+    if (fields.name !== undefined) {
+      sets.push('name = ?');
+      vals.push(fields.name);
+    }
+    if (fields.path !== undefined) {
+      sets.push('path = ?');
+      vals.push(fields.path);
+    }
+    if (sets.length) {
+      sets.push('updated_at = ?');
+      vals.push(new Date().toISOString());
+      vals.push(docId);
+      this.db
+        .prepare(`UPDATE doc_meta SET ${sets.join(', ')} WHERE doc_id = ?`)
+        .run(...vals);
+    }
+    return this.get(docId);
   }
 
   // --- Edit history (version snapshots) -----------------------------------

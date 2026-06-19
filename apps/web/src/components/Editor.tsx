@@ -264,6 +264,29 @@ export default function Editor({ docId }: { docId: string }) {
     navigator.clipboard.writeText(window.location.href).catch(() => {});
   };
 
+  // Rename the doc from the topbar. The path's final segment is kept in sync
+  // with the name so the directory-tree browser stays consistent.
+  const renameDocFromUI = () => {
+    if (!meta) return;
+    const current = (meta.path ?? meta.name).split('/').pop() ?? meta.name;
+    const next = window.prompt('Rename document', current);
+    if (!next || !next.trim() || next === current) return;
+    const name = next.trim();
+    const segs = (meta.path ?? meta.name).split('/');
+    segs[segs.length - 1] = name;
+    const path = segs.join('/');
+    fetch(`${SERVER_HTTP}/api/docs/${docId}`, {
+      method: 'PATCH',
+      headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ name, path }),
+    })
+      .then(async (r) => {
+        if (r.ok) setMeta((await r.json()) as DocMeta);
+      })
+      .catch(() => {});
+  };
+
   // --- annotation actions ----------------------------------------------------
 
   const snippet = useCallback(
@@ -495,7 +518,15 @@ export default function Editor({ docId }: { docId: string }) {
           ⌘
         </a>
         <div className="doc-title">
-          <span className="doc-name">{meta?.path ?? meta?.name ?? docId}</span>
+          <span
+            className="doc-name"
+            role={canEdit ? 'button' : undefined}
+            title={canEdit ? 'Click to rename' : undefined}
+            style={canEdit ? { cursor: 'pointer' } : undefined}
+            onClick={canEdit ? renameDocFromUI : undefined}
+          >
+            {meta?.path ?? meta?.name ?? docId}
+          </span>
           <span className={`conn-dot ${connected ? 'on' : ''}`} />
           <span className="conn-label">{connected ? 'live' : 'connecting…'}</span>
         </div>

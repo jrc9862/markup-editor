@@ -720,6 +720,26 @@ button { font-family: inherit; cursor: pointer; }
 
 .tree-filename::before { content: '◦ '; color: var(--muted); }
 
+.tree-file-row {
+  display: flex;
+  align-items: center;
+}
+
+.tree-file-row .tree-file { flex: 1; }
+
+.tree-rename {
+  visibility: hidden;
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 5px 8px;
+  font-size: 13px;
+}
+
+.tree-file-row:hover .tree-rename { visibility: visible; }
+.tree-rename:hover { color: var(--accent); }
+
 /* --- Doc list (home) ----------------------------------------------------------- */
 
 .doc-list {
