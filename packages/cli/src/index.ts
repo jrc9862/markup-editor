@@ -8,6 +8,7 @@ import { createDoc, getDoc, renameDoc } from './api.js';
 import { connectDoc } from './client.js';
 import { startDaemon, DISK_ORIGIN } from './daemon.js';
 import { loadManifest, saveManifest, manifestKey } from './manifest.js';
+import { hasState } from './state.js';
 import { WEB_URL } from './config.js';
 
 const program = new Command();
@@ -59,16 +60,26 @@ program
     }
 
     const docId = await ensureDoc(file);
-    const conn = await connectDoc(docId);
-
-    // Reconcile at startup: if the doc already lived on the server, its
-    // state wins; pull it down to disk. (ensureDoc seeded brand-new docs
-    // from the file, so for those this is a no-op.)
-    const serverContent = conn.ytext.toString();
     const diskContent = fs.readFileSync(abs, 'utf8');
-    if (serverContent !== diskContent) {
-      fs.writeFileSync(abs, serverContent);
-      console.log(`[markup] pulled latest server copy into ${file}`);
+
+    // Offline-capable reconcile: with a persisted base snapshot we fold local
+    // (possibly offline) edits in before sync, so the CRDT three-way-merges
+    // them with the server instead of server-wins clobbering. With no base
+    // yet (first run), bootstrap server-wins and start persisting from here.
+    const offline = hasState(docId);
+    const conn = await connectDoc(docId, {
+      persist: true,
+      seedDisk: offline ? diskContent : undefined,
+    });
+
+    const merged = conn.ytext.toString();
+    if (merged !== diskContent) {
+      fs.writeFileSync(abs, merged);
+      console.log(
+        offline
+          ? `[markup] merged local + server edits into ${file}`
+          : `[markup] pulled latest server copy into ${file}`,
+      );
     }
 
     const url = `${WEB_URL}/doc/${docId}`;
@@ -101,11 +112,18 @@ program
     }
 
     const docId = await ensureDoc(file);
-    const conn = await connectDoc(docId);
-
-    // Push local edits in (minimal diff, merges with any remote edits) ...
     const diskContent = fs.readFileSync(abs, 'utf8');
-    applyStringToYText(conn.ytext, diskContent, DISK_ORIGIN);
+
+    // With a persisted base, offline edits are folded in before connecting and
+    // merged by the CRDT during sync. Without one (first run), push the disk
+    // content in explicitly (minimal diff merges with remote), as before.
+    const offline = hasState(docId);
+    const conn = await connectDoc(docId, {
+      persist: true,
+      seedDisk: offline ? diskContent : undefined,
+    });
+    if (!offline) applyStringToYText(conn.ytext, diskContent, DISK_ORIGIN);
+
     // ... give the provider a beat to flush, then write the merged result.
     await new Promise((r) => setTimeout(r, 500));
     fs.writeFileSync(abs, conn.ytext.toString());
