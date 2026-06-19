@@ -669,6 +669,33 @@ button { font-family: inherit; cursor: pointer; }
   font-family: var(--mono);
 }
 
+.card.version.previewing {
+  outline: 1px solid var(--accent);
+}
+
+.version-preview-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  background: var(--surface-hover);
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.version-preview-body {
+  margin: 0;
+  padding: 24px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--fg);
+}
+
 .diff-view {
   margin-top: 8px;
   border: 1px solid var(--border);

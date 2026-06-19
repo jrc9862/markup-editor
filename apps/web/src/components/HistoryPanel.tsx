@@ -1,23 +1,28 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { lineDiff } from '@markup/sync-core';
 import type { VersionMeta } from '@markup/sync-core';
 import { SERVER_HTTP, authHeaders } from '@/lib/config';
 
-/** Togglable edit-history side panel: version list, diff view, restore. */
+/**
+ * Togglable edit-history side panel. Selecting a version previews it
+ * read-only to just this user (no diff, no effect on other collaborators —
+ * roadmap #9); restore is an explicit follow-up action.
+ */
 export default function HistoryPanel({
   docId,
-  currentContent,
+  previewingId,
+  onPreview,
+  onExitPreview,
   onClose,
 }: {
   docId: string;
-  currentContent: () => string;
+  previewingId: number | null;
+  onPreview: (v: VersionMeta, content: string) => void;
+  onExitPreview: () => void;
   onClose: () => void;
 }) {
   const [versions, setVersions] = useState<VersionMeta[]>([]);
-  const [openId, setOpenId] = useState<number | null>(null);
-  const [diff, setDiff] = useState<ReturnType<typeof lineDiff> | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const load = () => {
@@ -33,20 +38,16 @@ export default function HistoryPanel({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(load, [docId]);
 
-  const openVersion = async (id: number) => {
-    if (openId === id) {
-      setOpenId(null);
-      setDiff(null);
+  const selectVersion = async (v: VersionMeta) => {
+    if (previewingId === v.id) {
+      onExitPreview();
       return;
     }
-    const r = await fetch(
-      `${SERVER_HTTP}/api/docs/${docId}/versions/${id}`,
-      { headers: authHeaders(), credentials: 'include' },
-    );
-    const content = await r.text();
-    setOpenId(id);
-    // Diff oriented as version -> current: 'add' = present now, 'del' = only in version.
-    setDiff(lineDiff(content, currentContent()));
+    const r = await fetch(`${SERVER_HTTP}/api/docs/${docId}/versions/${v.id}`, {
+      headers: authHeaders(),
+      credentials: 'include',
+    });
+    onPreview(v, await r.text());
   };
 
   const restore = async (id: number) => {
@@ -56,8 +57,7 @@ export default function HistoryPanel({
       credentials: 'include',
       body: JSON.stringify({ versionId: id }),
     });
-    setOpenId(null);
-    setDiff(null);
+    onExitPreview();
     load();
   };
 
@@ -81,12 +81,15 @@ export default function HistoryPanel({
         <button className="ghost-btn" onClick={onClose} title="Close">✕</button>
       </div>
       <div className="history-body">
-        <p className="empty">snapshots are taken as people edit</p>
+        <p className="empty">click a version to preview it read-only</p>
         {error && <p className="empty">{error}</p>}
         {versions.length === 0 && <p className="empty">No versions yet.</p>}
         {versions.map((v) => (
-          <div className="card version" key={v.id}>
-            <div className="card-head clickable" onClick={() => openVersion(v.id)}>
+          <div
+            className={`card version ${previewingId === v.id ? 'previewing' : ''}`}
+            key={v.id}
+          >
+            <div className="card-head clickable" onClick={() => selectVersion(v)}>
               <strong className="mono">{v.name ?? `v${v.id}`}</strong>
               <span className="when">{new Date(v.createdAt).toLocaleString()}</span>
               <span className="when">{v.size} B</span>
@@ -97,32 +100,15 @@ export default function HistoryPanel({
                 {v.name && <span className="when">v{v.id}</span>}
               </div>
             )}
-            {openId === v.id && diff && (
-              <>
-                <div className="diff-view">
-                  {diff.map((chunk, i) =>
-                    chunk.op === 'equal'
-                      ? null
-                      : chunk.lines.map((line, j) => (
-                          <div key={`${i}-${j}`} className={`diff-line ${chunk.op}`}>
-                            {chunk.op === 'add' ? '+ ' : '- '}
-                            {line}
-                          </div>
-                        )),
-                  )}
-                  {diff.every((c) => c.op === 'equal') && (
-                    <div className="diff-line">identical to current</div>
-                  )}
-                </div>
-                <div className="card-actions">
-                  <button className="primary-btn" onClick={() => restore(v.id)}>
-                    Restore this version
-                  </button>
-                  <button className="ghost-btn" onClick={() => nameVersion(v)}>
-                    {v.name ? 'Rename' : 'Name…'}
-                  </button>
-                </div>
-              </>
+            {previewingId === v.id && (
+              <div className="card-actions">
+                <button className="primary-btn" onClick={() => restore(v.id)}>
+                  Restore this version
+                </button>
+                <button className="ghost-btn" onClick={() => nameVersion(v)}>
+                  {v.name ? 'Rename' : 'Name…'}
+                </button>
+              </div>
             )}
           </div>
         ))}

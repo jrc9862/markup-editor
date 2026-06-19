@@ -117,6 +117,13 @@ export default function Editor({ docId }: { docId: string }) {
   const [selection, setSelection] = useState<Range | null>(null);
   const [composer, setComposer] = useState<'comment' | 'suggest' | null>(null);
   const [showHistory, setShowHistory] = useState(false);
+  // Local-only read-only preview of a past version (roadmap #9): visible to
+  // just this user, no diff, no effect on other collaborators.
+  const [preview, setPreview] = useState<{
+    id: number;
+    label: string;
+    content: string;
+  } | null>(null);
   // Realtime suggestion mode (source mode): keystrokes become suggestions.
   const [suggesting, setSuggesting] = useState(false);
   // Bumped whenever floating-card positions may have shifted.
@@ -602,7 +609,23 @@ export default function Editor({ docId }: { docId: string }) {
         <main className="page-area">
           <div className="doc-row">
             <div className="page">
-              {!synced || !conn ? (
+              {preview ? (
+                <div className="version-preview">
+                  <div className="version-preview-bar">
+                    <span>
+                      Previewing <strong>{preview.label}</strong> — read-only,
+                      visible only to you
+                    </span>
+                    <button
+                      className="ghost-btn"
+                      onClick={() => setPreview(null)}
+                    >
+                      Exit preview
+                    </button>
+                  </div>
+                  <pre className="version-preview-body">{preview.content}</pre>
+                </div>
+              ) : !synced || !conn ? (
                 <p className="loading">Loading document…</p>
               ) : mode === 'source' ? (
                 <SourceEditor
@@ -698,8 +721,15 @@ export default function Editor({ docId }: { docId: string }) {
         {showHistory && conn && (
           <HistoryPanel
             docId={docId}
-            currentContent={() => conn.ytext.toString()}
-            onClose={() => setShowHistory(false)}
+            previewingId={preview?.id ?? null}
+            onPreview={(v, content) =>
+              setPreview({ id: v.id, label: v.name ?? `v${v.id}`, content })
+            }
+            onExitPreview={() => setPreview(null)}
+            onClose={() => {
+              setShowHistory(false);
+              setPreview(null);
+            }}
           />
         )}
       </div>
