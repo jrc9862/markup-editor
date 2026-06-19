@@ -92,17 +92,29 @@ on the live Y.Doc through a server-side direct connection, so agent actions
 reach every connected human (and the CLI daemon → disk) in realtime:
 
 - `GET /api/docs` · `GET /api/docs/:id` · `GET /api/docs/:id/snapshot`
+- `PATCH /api/docs/:id` `{name?,path?}` — rename/re-path (write; `markup mv`
+  and the UI use this; path is sanitized — no leading slash / `..`)
 - `PUT /api/docs/:id/content` `{content}` — direct write (minimal-diffed)
+- `POST /api/docs/:id/edits` — multi-edits as ONE transaction: either
+  `{find,replace,regex?,caseSensitive?}` or `{edits:[{from,to,insert}]}`
 - `GET|POST /api/docs/:id/comments` · `POST .../comments/:tid/replies` ·
   `POST .../comments/:tid/resolve`
 - `GET|POST /api/docs/:id/suggestions` · `PUT|DELETE .../suggestions/:sid`
   (author revises/withdraws while open; write capability may touch any) ·
   `POST .../suggestions/:sid/accept` · `POST .../suggestions/:sid/reject` ·
-  `POST .../suggestions/:sid/replies` (review discussion on a suggestion)
-- `GET .../versions` · `GET .../versions/:vid` · `POST .../restore`
+  `POST .../suggestions/:sid/replies` (review discussion on a suggestion) ·
+  `POST .../suggestions/review` `{accept[],reject[]}` — PR-style batch review
+- `GET .../events` — SSE stream of doc events (comments/suggestions/reviews/
+  content/`mention`); agents subscribe instead of polling
+- `GET .../versions` · `GET .../versions/:vid` · `PUT .../versions/:vid`
+  `{name}` (name a version) · `POST .../restore`
 - `GET /api/me` · `GET|POST /api/tokens` · `DELETE /api/tokens/:id`
 - `GET|POST /api/docs/:id/permissions` · `DELETE .../permissions/:userId` ·
   `PUT .../permissions/link` (owner only)
+- `GET /api/git/status` · `GET /api/git/branches` · `POST /api/git/commit`
+  `{message,paths?}` · `POST /api/git/branch` `{name,checkout?}` ·
+  `POST /api/git/checkout` `{name}` — only when `MARKUP_REPO_DIR` is set (404
+  otherwise); git args passed as arrays (no shell)
 
 Suggestion creation accepts an optional caller-supplied `id` (409 on
 duplicate) — this is how optimistic clients reconcile the server echo.
@@ -174,7 +186,9 @@ comments/suggestions; self-reported names are ignored. Web uses
 (`credentials: 'include'`; CORS locked to `MARKUP_WEB_ORIGIN`, default
 `http://localhost:3000`). Other env:
 `PORT`, `MARKUP_DATA_DIR`, `DATABASE_URL` (server — Postgres when set, SQLite
-otherwise); `MARKUP_SERVER`, `MARKUP_WEB` (CLI); `NEXT_PUBLIC_MARKUP_SERVER`
+otherwise), `MARKUP_REPO_DIR` (server — enables the git-native flow routes
+against that working tree; unset = those routes 404); `MARKUP_SERVER`,
+`MARKUP_WEB` (CLI); `NEXT_PUBLIC_MARKUP_SERVER`
 (web). `NEXT_PUBLIC_*` values are inlined into the web bundle at **build
 time** — for a deployed web image they are Docker build args, not runtime env.
 The web app builds with `output: 'standalone'`; its Docker image runs the
@@ -328,38 +342,39 @@ way), mono accents (CSS vars in `globals.css`).
 
 ## Roadmap (not yet built)
 
-1. **Multi-edits** — batch find/replace and multi-range operations that apply
-   as one undoable transaction.
-2. **Accounts & sharing permissions** — milestones 1+2 shipped (OIDC/dev
+1. **Accounts & sharing permissions** — milestones 1+2 shipped (OIDC/dev
    sign-in, sessions, scoped tokens, attribution, per-doc roles + ACL with
    server-side REST/WS enforcement, MARKUP_REQUIRE_AUTH; see
    PHASE1_IDENTITY.md), plus the role-aware web UI (Share popover, role
    badge, read-only editor below editor role with REST-backed annotations).
    Remaining: workspace membership, SAML/SCIM.
-3. **Git-native flows** — commit/branch from the UI, PR-style review of
-   suggestion batches.
-4. **Conflict-free offline `sync`** — persist the CLI's Yjs state vector in
-   `.markup/` so offline edits three-way-merge instead of server-wins.
-5. **Named versions + per-author attribution** in history.
-6. **Agent identity & events** — distinguish agent principals from humans
-   (presence badges, per-agent tokens), plus webhooks/SSE so agents can
-   subscribe to mentions, new comments, or suggestion reviews instead of
-   polling.
-7. **File rename handling** — renaming a file on disk (or in the UI) should
-   update the doc's name/path everywhere: manifest remapping in the CLI,
-   doc_meta, the doc-list tree, and open editor topbars.
-8. **Live, intelligently grouped history** — the history panel should hot-
-   reload as edits land in the current doc, with changes grouped into
-   meaningful versions (e.g. by author + editing burst), not just the
-   fixed ≥60s debounce.
-9. **History as local version preview** — selecting a version shows that
-   version of the document read-only to *just the selecting user* (no
-   diff view, no effect on other collaborators), with restore as an
-   explicit follow-up action.
+2. **Enterprise Phase 2 (scale/ops)** — Redis multi-node, observability,
+   backups, rate limits, load testing (see ENTERPRISE_PLAN.md).
 
 Shipped from the original roadmap: togglable realtime suggestion mode
 (both source and rendered modes), in-rendered-view annotation highlights,
-cross-mode presence
-(terminal-style remote cursors in both modes), and the **MCP server**
-(`packages/mcp-server` → `markup-mcp`, a stdio wrapper over the agent REST
-surface: read_doc, comment, suggest, accept, list_docs, …).
+cross-mode presence (terminal-style remote cursors in both modes), the
+**MCP server** (`packages/mcp-server` → `markup-mcp`, a stdio wrapper over the
+agent REST surface), plus the full user-feature sweep:
+
+- **Multi-edits** — `POST /api/docs/:id/edits` (find/replace or explicit
+  ranges) and a web Find & Replace panel, applied as one transaction via
+  sync-core `applyEdits`/`findReplaceEdits`.
+- **Git-native flows** — server GitBridge (`apps/server/src/git.ts`, gated by
+  `MARKUP_REPO_DIR`) with commit/branch/checkout REST + web Git panel, and
+  PR-style batch suggestion review (`POST .../suggestions/review` + web Review
+  panel).
+- **Conflict-free offline sync** — CLI persists each doc's Yjs state under
+  `.markup/state/<docId>.bin` (`packages/cli/src/state.ts`) and folds offline
+  edits in before connecting, so reconnect CRDT-merges instead of server-wins.
+- **Named versions + per-author attribution** — `doc_versions.name/author/
+  author_id`, `PUT .../versions/:vid`, attribution captured from the last
+  editor (WS context + REST writers) into the history snapshot.
+- **Agent identity & events** — server event bus + SSE `GET .../events`
+  (comments/suggestions/reviews/content/`mention`), an `agent` flag on events,
+  agent presence badges (`PresenceUser.kind`), and MCP `watch_events`.
+- **File rename handling** — `PATCH /api/docs/:id`, `markup mv`, click-to-
+  rename in the topbar and doc-list tree.
+- **Live, grouped history** + **local version preview** — the HistoryPanel
+  hot-reloads, groups snapshots into author/burst sessions, and previews a
+  version read-only to just the selecting user (no diff, restore is explicit).

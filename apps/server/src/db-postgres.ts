@@ -68,6 +68,10 @@ const MIGRATIONS: string[] = [
      role TEXT NOT NULL,
      PRIMARY KEY (doc_id, user_id)
    )`,
+  // Named versions + per-author attribution (roadmap #5).
+  `ALTER TABLE doc_versions ADD COLUMN name TEXT`,
+  `ALTER TABLE doc_versions ADD COLUMN author TEXT`,
+  `ALTER TABLE doc_versions ADD COLUMN author_id TEXT`,
 ];
 
 const MIGRATION_LOCK_KEY = 0x6d61726b; // arbitrary app-wide advisory lock id
@@ -194,10 +198,38 @@ export class PostgresMetaStore implements MetaStore {
     ]);
   }
 
+  async rename(
+    docId: string,
+    fields: { name?: string; path?: string },
+  ): Promise<DocMeta | undefined> {
+    const sets: string[] = [];
+    const vals: unknown[] = [];
+    if (fields.name !== undefined) {
+      vals.push(fields.name);
+      sets.push(`name = $${vals.length}`);
+    }
+    if (fields.path !== undefined) {
+      vals.push(fields.path);
+      sets.push(`path = $${vals.length}`);
+    }
+    if (sets.length) {
+      vals.push(new Date().toISOString());
+      sets.push(`updated_at = $${vals.length}`);
+      vals.push(docId);
+      await this.pool.query(
+        `UPDATE doc_meta SET ${sets.join(', ')} WHERE doc_id = $${vals.length}`,
+        vals,
+      );
+    }
+    return this.get(docId);
+  }
+
   async maybeAddVersion(
     docId: string,
     content: string,
     minIntervalMs = 60_000,
+    author?: string,
+    authorId?: string,
   ): Promise<boolean> {
     const { rows } = await this.pool.query<{
       content: string;
@@ -212,8 +244,8 @@ export class PostgresMetaStore implements MetaStore {
       if (Date.now() - Date.parse(last.created_at) < minIntervalMs) return false;
     }
     await this.pool.query(
-      'INSERT INTO doc_versions (doc_id, content, created_at) VALUES ($1, $2, $3)',
-      [docId, content, new Date().toISOString()],
+      'INSERT INTO doc_versions (doc_id, content, created_at, author, author_id) VALUES ($1, $2, $3, $4, $5)',
+      [docId, content, new Date().toISOString(), author ?? null, authorId ?? null],
     );
     return true;
   }
@@ -222,9 +254,12 @@ export class PostgresMetaStore implements MetaStore {
     const { rows } = await this.pool.query<{
       id: string;
       created_at: string;
+      name: string | null;
+      author: string | null;
+      author_id: string | null;
       size: string;
     }>(
-      'SELECT id, created_at, LENGTH(content) AS size FROM doc_versions WHERE doc_id = $1 ORDER BY id DESC',
+      'SELECT id, created_at, name, author, author_id, LENGTH(content) AS size FROM doc_versions WHERE doc_id = $1 ORDER BY id DESC',
       [docId],
     );
     return rows.map((r) => ({
@@ -232,7 +267,22 @@ export class PostgresMetaStore implements MetaStore {
       docId,
       createdAt: r.created_at,
       size: Number(r.size),
+      name: r.name ?? undefined,
+      author: r.author ?? undefined,
+      authorId: r.author_id ?? undefined,
     }));
+  }
+
+  async nameVersion(
+    docId: string,
+    versionId: number,
+    name: string,
+  ): Promise<boolean> {
+    const res = await this.pool.query(
+      'UPDATE doc_versions SET name = $1 WHERE doc_id = $2 AND id = $3',
+      [name, docId, versionId],
+    );
+    return (res.rowCount ?? 0) > 0;
   }
 
   async getVersionContent(

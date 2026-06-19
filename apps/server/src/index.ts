@@ -9,6 +9,9 @@ import { v4 as uuidv4 } from 'uuid';
 import type * as Y from 'yjs';
 import {
   applyStringToYText,
+  applyEdits,
+  findReplaceEdits,
+  type RangeEdit,
   CONTENT_FIELD,
   addComment,
   addReply,
@@ -35,6 +38,8 @@ import {
 } from './auth.js';
 import { registerAuthRoutes, registerTokenRoutes } from './auth-routes.js';
 import { oidcFromEnv } from './oidc.js';
+import { docEvents, extractMentions, type DocEvent } from './events.js';
+import { GitBridge, isValidRef } from './git.js';
 import {
   PostgresMetaStore,
   fetchYjsState,
@@ -53,6 +58,9 @@ const LEGACY_TOKEN = REQUIRE_AUTH ? undefined : TOKEN;
 const SERVER_ORIGIN =
   process.env.MARKUP_SERVER_ORIGIN ?? `http://localhost:${PORT}`;
 const OIDC = oidcFromEnv(SERVER_ORIGIN);
+// Git-native flows are enabled only when the server can reach a working tree
+// (MARKUP_REPO_DIR) — the self-hosted/local shape. Otherwise the routes 404.
+const git = GitBridge.fromEnv();
 
 // --- Data layer: Postgres when DATABASE_URL is set, SQLite otherwise --------
 //
@@ -79,6 +87,19 @@ const persistence = pool
 
 // --- Hocuspocus: the Yjs sync engine + persistence -------------------------
 
+/** Best-effort attribution label for a principal (for version history). */
+function principalLabel(p: Principal): { author?: string; authorId?: string } {
+  if (p.kind === 'user') return { author: p.user.name, authorId: p.user.id };
+  if (p.kind === 'agent') return { author: p.tokenName, authorId: p.user.id };
+  return {};
+}
+
+// The most recent editor per doc, captured from authenticated connections (and
+// REST writers). Consumed when onStoreDocument snapshots a version, so history
+// carries best-effort per-author attribution. In-memory only — attribution is
+// a display nicety, not a source of truth.
+const lastEditor = new Map<string, { author?: string; authorId?: string }>();
+
 const hocuspocus = Hocuspocus.configure({
   extensions: [persistence],
 
@@ -102,14 +123,30 @@ const hocuspocus = Hocuspocus.configure({
     // incoming doc updates server-side. Suggester/commenter roles act
     // through the REST surface instead.
     if (!scopeAllows(scope, 'write')) connection.readOnly = true;
+    // The returned value becomes the connection context; onChange uses it to
+    // attribute the resulting version snapshot.
+    return principalLabel(principal);
+  },
+
+  async onChange({ documentName, context }) {
+    const c = context as { author?: string; authorId?: string } | undefined;
+    if (c?.author) lastEditor.set(documentName, c);
   },
 
   async onStoreDocument({ documentName, document }) {
     await meta.touch(documentName);
     // Edit history: snapshot the markdown, debounced inside maybeAddVersion
-    // so active typing doesn't create a version per save.
+    // so active typing doesn't create a version per save. Stamp the snapshot
+    // with the most recent editor we saw.
     const content = document.getText(CONTENT_FIELD).toString();
-    await meta.maybeAddVersion(documentName, content);
+    const editor = lastEditor.get(documentName);
+    await meta.maybeAddVersion(
+      documentName,
+      content,
+      undefined,
+      editor?.author,
+      editor?.authorId,
+    );
   },
 });
 
@@ -176,6 +213,36 @@ function authorOf(
     return { author: bodyAuthor ?? p.tokenName, authorId: p.user.id };
   }
   return bodyAuthor ? { author: bodyAuthor } : null;
+}
+
+/**
+ * Publish a realtime doc event (consumed by SSE subscribers), stamping the
+ * timestamp and whether the actor is an agent principal.
+ */
+function publish(
+  res: express.Response,
+  docId: string,
+  ev: Omit<DocEvent, 'docId' | 'ts' | 'agent'>,
+): void {
+  const p = res.locals.principal as Principal;
+  docEvents.publish({
+    docId,
+    ts: new Date().toISOString(),
+    agent: p.kind === 'agent',
+    ...ev,
+  });
+}
+
+/** Emit a mention event for each @handle found in `text`. */
+function publishMentions(
+  res: express.Response,
+  docId: string,
+  text: string,
+  who: { author: string; authorId?: string },
+): void {
+  for (const mention of extractMentions(text)) {
+    publish(res, docId, { type: 'mention', mention, text, ...who });
+  }
 }
 
 /**
@@ -249,6 +316,58 @@ app.get('/api/docs/:docId', needs('read'), docAccess('read'), async (_req, res) 
   res.json({ ...docMeta, myRole: await roleFor(meta, p, docMeta) });
 });
 
+/**
+ * Normalize a caller-supplied relative path to the manifest/tree convention:
+ * forward slashes, no leading slash, no `..` traversal. Returns null on a
+ * path that escapes the tree (the CLI writes these paths to disk).
+ */
+function cleanRelPath(p: string): string | null {
+  if (p.includes('\0')) return null;
+  const norm = p.replace(/\\/g, '/').replace(/^\/+/, '');
+  if (norm.split('/').some((seg) => seg === '..')) return null;
+  return norm;
+}
+
+/**
+ * Rename / re-path a doc (UI topbar, doc-list, or `markup mv`). Editors and
+ * above (write capability) may rename; the new path mirrors the file's
+ * location on disk so the directory-tree browser stays in sync.
+ */
+app.patch('/api/docs/:docId', needs('write'), docAccess('write'), async (req, res) => {
+  const body = req.body as { name?: string; path?: string };
+  const fields: { name?: string; path?: string } = {};
+  if (body.name !== undefined) {
+    if (typeof body.name !== 'string' || !body.name.trim()) {
+      res.status(400).json({ error: 'name must be a non-empty string' });
+      return;
+    }
+    fields.name = body.name.trim();
+  }
+  if (body.path !== undefined) {
+    if (typeof body.path !== 'string') {
+      res.status(400).json({ error: 'path must be a string' });
+      return;
+    }
+    const clean = cleanRelPath(body.path);
+    if (clean === null) {
+      res.status(400).json({ error: 'invalid path' });
+      return;
+    }
+    fields.path = clean;
+  }
+  if (fields.name === undefined && fields.path === undefined) {
+    res.status(400).json({ error: 'name or path is required' });
+    return;
+  }
+  const updated = await meta.rename(req.params.docId, fields);
+  if (!updated) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+  const p = res.locals.principal as Principal;
+  res.json({ ...updated, myRole: await roleFor(meta, p, updated) });
+});
+
 /** Snapshot: the document's current markdown as plain text. */
 app.get('/api/docs/:docId/snapshot', needs('read'), docAccess('read'), async (req, res) => {
   const conn = await hocuspocus.openDirectConnection(req.params.docId);
@@ -319,7 +438,66 @@ app.put('/api/docs/:docId/content', needs('write'), docAccess('write'), async (r
   await withDoc(req.params.docId, (doc) =>
     applyStringToYText(doc.getText(CONTENT_FIELD), content),
   );
+  // Direct (REST) writes carry no WS context, so attribute the snapshot here.
+  lastEditor.set(req.params.docId, principalLabel(res.locals.principal as Principal));
+  publish(res, req.params.docId, { type: 'content' });
   res.json({ ok: true });
+});
+
+/**
+ * Multi-edits (roadmap #1): batch find/replace or an explicit list of range
+ * replacements applied as ONE transaction — one undoable step that still
+ * merges cleanly with concurrent peers. Body is either:
+ *   { find, replace, regex?, caseSensitive? }   — find/replace across the doc
+ *   { edits: [{ from, to, insert }, ...] }       — explicit ranges
+ */
+app.post('/api/docs/:docId/edits', needs('write'), docAccess('write'), async (req, res) => {
+  const body = req.body as {
+    find?: string;
+    replace?: string;
+    regex?: boolean;
+    caseSensitive?: boolean;
+    edits?: RangeEdit[];
+  };
+  const hasFind = typeof body.find === 'string';
+  const hasEdits = Array.isArray(body.edits);
+  if (hasFind === hasEdits) {
+    res.status(400).json({ error: 'provide exactly one of {find,replace} or {edits}' });
+    return;
+  }
+  if (hasEdits) {
+    for (const e of body.edits!) {
+      if (
+        typeof e?.from !== 'number' ||
+        typeof e?.to !== 'number' ||
+        typeof e?.insert !== 'string'
+      ) {
+        res.status(400).json({ error: 'each edit needs from, to, insert' });
+        return;
+      }
+    }
+  }
+  const result = await withDoc(req.params.docId, (doc) => {
+    const ytext = doc.getText(CONTENT_FIELD);
+    const edits = hasEdits
+      ? body.edits!
+      : findReplaceEdits(ytext.toString(), body.find!, body.replace ?? '', {
+          regex: body.regex,
+          caseSensitive: body.caseSensitive,
+        });
+    try {
+      return { applied: applyEdits(ytext, edits) };
+    } catch (err) {
+      return { error: err instanceof Error ? err.message : 'invalid edits' };
+    }
+  });
+  if ('error' in result) {
+    res.status(400).json(result);
+    return;
+  }
+  lastEditor.set(req.params.docId, principalLabel(res.locals.principal as Principal));
+  publish(res, req.params.docId, { type: 'content' });
+  res.json(result);
 });
 
 app.get('/api/docs/:docId/comments', needs('read'), docAccess('read'), async (req, res) => {
@@ -343,6 +521,8 @@ app.post('/api/docs/:docId/comments', needs('comment'), docAccess('comment'), as
     res.status(400).json({ error: 'range not found (from/to or anchorText)' });
     return;
   }
+  publish(res, req.params.docId, { type: 'comment', threadId: result, text: body.text, ...who });
+  publishMentions(res, req.params.docId, body.text, who);
   res.status(201).json({ id: result });
 });
 
@@ -360,6 +540,13 @@ app.post(
     await withDoc(req.params.docId, (doc) =>
       addReply(doc, req.params.threadId, { ...who, text }),
     );
+    publish(res, req.params.docId, {
+      type: 'comment.reply',
+      threadId: req.params.threadId,
+      text,
+      ...who,
+    });
+    publishMentions(res, req.params.docId, text, who);
     res.json({ ok: true });
   },
 );
@@ -373,12 +560,39 @@ app.post(
     await withDoc(req.params.docId, (doc) =>
       setResolved(doc, req.params.threadId, resolved),
     );
+    publish(res, req.params.docId, {
+      type: 'comment.resolve',
+      threadId: req.params.threadId,
+    });
     res.json({ ok: true });
   },
 );
 
 app.get('/api/docs/:docId/suggestions', needs('read'), docAccess('read'), async (req, res) => {
   res.json(await withDoc(req.params.docId, (doc) => snapshotSuggestions(doc)));
+});
+
+/**
+ * Realtime event stream (SSE) for a doc — the agent-native alternative to
+ * polling. Subscribers (agents or the web) receive comments, suggestions,
+ * reviews, mentions, and edits as they happen. Requires read access; a
+ * heartbeat comment keeps proxies from closing an idle stream.
+ */
+app.get('/api/docs/:docId/events', needs('read'), docAccess('read'), (req, res) => {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+  });
+  res.write(': connected\n\n');
+  const unsubscribe = docEvents.subscribe(req.params.docId, (e) => {
+    res.write(`event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`);
+  });
+  const heartbeat = setInterval(() => res.write(': ping\n\n'), 25_000);
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    unsubscribe();
+  });
 });
 
 app.post('/api/docs/:docId/suggestions', needs('suggest'), docAccess('suggest'), async (req, res) => {
@@ -420,6 +634,7 @@ app.post('/api/docs/:docId/suggestions', needs('suggest'), docAccess('suggest'),
     res.status(400).json({ error: 'range not found (from/to or anchorText)' });
     return;
   }
+  publish(res, req.params.docId, { type: 'suggestion', suggestionId: result, ...who });
   res.status(201).json({ id: result });
 });
 
@@ -484,6 +699,10 @@ app.put(
       res.status(400).json({ error: 'range out of bounds' });
       return;
     }
+    publish(res, req.params.docId, {
+      type: 'suggestion.update',
+      suggestionId: req.params.sid,
+    });
     res.json({ ok: true });
   },
 );
@@ -531,6 +750,13 @@ app.post(
       res.status(404).json({ error: 'not found' });
       return;
     }
+    publish(res, req.params.docId, {
+      type: 'suggestion.reply',
+      suggestionId: req.params.sid,
+      text,
+      ...who,
+    });
+    publishMentions(res, req.params.docId, text, who);
     res.json({ ok: true });
   },
 );
@@ -543,6 +769,10 @@ app.post(
     const ok = await withDoc(req.params.docId, (doc) =>
       acceptSuggestion(doc, doc.getText(CONTENT_FIELD), req.params.sid),
     );
+    publish(res, req.params.docId, {
+      type: 'suggestion.accept',
+      suggestionId: req.params.sid,
+    });
     res.json({ ok });
   },
 );
@@ -555,7 +785,55 @@ app.post(
     await withDoc(req.params.docId, (doc) =>
       rejectSuggestion(doc, req.params.sid),
     );
+    publish(res, req.params.docId, {
+      type: 'suggestion.reject',
+      suggestionId: req.params.sid,
+    });
     res.json({ ok: true });
+  },
+);
+
+/**
+ * PR-style batch review (roadmap #3): accept and/or reject a set of open
+ * suggestions in ONE transaction — the reviewer dispositions a whole batch at
+ * once, applied atomically and propagated like a single edit.
+ */
+app.post(
+  '/api/docs/:docId/suggestions/review',
+  needs('write'),
+  docAccess('write'),
+  async (req, res) => {
+    const body = req.body as { accept?: string[]; reject?: string[] };
+    const accept = Array.isArray(body.accept) ? body.accept : [];
+    const reject = Array.isArray(body.reject) ? body.reject : [];
+    if (accept.length === 0 && reject.length === 0) {
+      res.status(400).json({ error: 'provide accept[] and/or reject[]' });
+      return;
+    }
+    const result = await withDoc(req.params.docId, (doc) => {
+      const ytext = doc.getText(CONTENT_FIELD);
+      let accepted = 0;
+      let rejected = 0;
+      // Accept in descending range order so earlier offsets stay valid as
+      // later replacements resize the text.
+      const toAccept = accept
+        .map((id) => ({ id, s: getSuggestion(doc, id) }))
+        .filter((x) => x.s && x.s.status === 'open')
+        .sort((a, b) => (b.s!.from ?? 0) - (a.s!.from ?? 0));
+      for (const { id } of toAccept) {
+        if (acceptSuggestion(doc, ytext, id)) accepted++;
+      }
+      for (const id of reject) {
+        const s = getSuggestion(doc, id);
+        if (s && s.status === 'open') {
+          rejectSuggestion(doc, id);
+          rejected++;
+        }
+      }
+      return { accepted, rejected };
+    });
+    if (result.accepted > 0) publish(res, req.params.docId, { type: 'content' });
+    res.json(result);
   },
 );
 
@@ -646,10 +924,108 @@ app.put('/api/docs/:docId/permissions/link', ownerOnly, async (req, res) => {
   res.json({ ok: true });
 });
 
+// --- Git-native flows (roadmap #3) --------------------------------------------
+//
+// Commit/branch the real .md files from the UI. Enabled only when the server
+// has a working tree (MARKUP_REPO_DIR); all git args are passed as arrays, so
+// messages and paths can't inject. Read ops need read scope; mutations need
+// write scope (repo-global, not per-doc).
+
+const gitEnabled: express.RequestHandler = (_req, res, next) => {
+  if (!git) {
+    res.status(404).json({ error: 'git flows are not enabled on this server' });
+    return;
+  }
+  next();
+};
+
+app.get('/api/git/status', needs('read'), gitEnabled, async (_req, res) => {
+  try {
+    res.json(await git!.status());
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
+app.get('/api/git/branches', needs('read'), gitEnabled, async (_req, res) => {
+  try {
+    res.json({
+      current: await git!.currentBranch(),
+      branches: await git!.listBranches(),
+    });
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
+app.post('/api/git/commit', needs('write'), gitEnabled, async (req, res) => {
+  const body = req.body as { message?: string; paths?: string[] };
+  if (typeof body.message !== 'string' || !body.message.trim()) {
+    res.status(400).json({ error: 'message is required' });
+    return;
+  }
+  if (body.paths && !Array.isArray(body.paths)) {
+    res.status(400).json({ error: 'paths must be an array' });
+    return;
+  }
+  try {
+    res.json(await git!.commit(body.message.trim(), body.paths));
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+app.post('/api/git/branch', needs('write'), gitEnabled, async (req, res) => {
+  const body = req.body as { name?: string; checkout?: boolean };
+  if (!isValidRef(body.name ?? '')) {
+    res.status(400).json({ error: 'invalid branch name' });
+    return;
+  }
+  try {
+    await git!.createBranch(body.name!, body.checkout ?? true);
+    res.json({ ok: true, branch: body.name });
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+app.post('/api/git/checkout', needs('write'), gitEnabled, async (req, res) => {
+  const name = (req.body as { name?: string }).name;
+  if (!isValidRef(name ?? '')) {
+    res.status(400).json({ error: 'invalid branch name' });
+    return;
+  }
+  try {
+    await git!.checkout(name!);
+    res.json({ ok: true, branch: name });
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
 // --- Edit history -------------------------------------------------------------
 
 app.get('/api/docs/:docId/versions', needs('read'), docAccess('read'), async (req, res) => {
   res.json(await meta.listVersions(req.params.docId));
+});
+
+/** Give a version a human-friendly name (editorial action → write). */
+app.put('/api/docs/:docId/versions/:versionId', needs('write'), docAccess('write'), async (req, res) => {
+  const name = (req.body as { name?: string })?.name;
+  if (typeof name !== 'string' || !name.trim()) {
+    res.status(400).json({ error: 'name (non-empty string) is required' });
+    return;
+  }
+  const ok = await meta.nameVersion(
+    req.params.docId,
+    Number(req.params.versionId),
+    name.trim(),
+  );
+  if (!ok) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+  res.json({ ok: true });
 });
 
 app.get('/api/docs/:docId/versions/:versionId', needs('read'), docAccess('read'), async (req, res) => {

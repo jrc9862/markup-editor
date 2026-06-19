@@ -317,13 +317,145 @@ export function createMcpServer(
       ),
   );
 
+  // --- Multi-edits ------------------------------------------------------------
+
+  server.registerTool(
+    'find_replace',
+    {
+      title: 'Find and replace',
+      description:
+        'Replace every match of `find` with `replace` across the document in ONE atomic edit. Plain substring by default; set regex for a JS RegExp (with $1.. backrefs). Requires write capability.',
+      inputSchema: {
+        ...docId,
+        find: z.string().describe('Text or regex to search for.'),
+        replace: z.string().describe('Replacement text ($1.. backrefs in regex mode).'),
+        regex: z.boolean().optional().describe('Treat `find` as a regular expression.'),
+        caseSensitive: z.boolean().optional().describe('Case-sensitive match (default false).'),
+      },
+    },
+    (a) =>
+      run(() =>
+        client.multiEdit(a.docId, {
+          find: a.find,
+          replace: a.replace,
+          regex: a.regex,
+          caseSensitive: a.caseSensitive,
+        }),
+      ),
+  );
+
+  server.registerTool(
+    'multi_edit',
+    {
+      title: 'Multi-edit',
+      description:
+        'Apply a batch of explicit range replacements (offsets into the current text) as ONE atomic, undoable edit. Edits must not overlap. Requires write capability.',
+      inputSchema: {
+        ...docId,
+        edits: z
+          .array(
+            z.object({
+              from: z.number().int().describe('Start offset.'),
+              to: z.number().int().describe('End offset (exclusive).'),
+              insert: z.string().describe('Replacement text.'),
+            }),
+          )
+          .describe('Non-overlapping range replacements.'),
+      },
+    },
+    (a) => run(() => client.multiEdit(a.docId, { edits: a.edits })),
+  );
+
+  server.registerTool(
+    'review_suggestions',
+    {
+      title: 'Batch-review suggestions',
+      description:
+        'Accept and/or reject a set of open suggestions in one atomic review. Requires write capability.',
+      inputSchema: {
+        ...docId,
+        accept: z.array(z.string()).optional().describe('Suggestion ids to accept.'),
+        reject: z.array(z.string()).optional().describe('Suggestion ids to reject.'),
+      },
+    },
+    (a) => run(() => client.reviewSuggestions(a.docId, a.accept ?? [], a.reject ?? [])),
+  );
+
+  // --- Git-native flows -------------------------------------------------------
+
+  server.registerTool(
+    'git_status',
+    {
+      title: 'Git status',
+      description:
+        'Current branch and working-tree status (enabled only when the server has a repo: MARKUP_REPO_DIR).',
+      inputSchema: {},
+    },
+    () => run(() => client.gitStatus()),
+  );
+
+  server.registerTool(
+    'git_commit',
+    {
+      title: 'Git commit',
+      description:
+        'Stage and commit the .md files (all changes, or just `paths`). Requires write capability.',
+      inputSchema: {
+        message: z.string().describe('Commit message.'),
+        paths: z.array(z.string()).optional().describe('Specific paths to commit.'),
+      },
+    },
+    (a) => run(() => client.gitCommit(a.message, a.paths)),
+  );
+
+  server.registerTool(
+    'git_branch',
+    {
+      title: 'Git branch',
+      description: 'Create a branch (and check it out by default). Requires write capability.',
+      inputSchema: {
+        name: z.string().describe('New branch name.'),
+        checkout: z.boolean().optional().describe('Check it out (default true).'),
+      },
+    },
+    (a) => run(() => client.gitBranch(a.name, a.checkout ?? true)),
+  );
+
+  // --- Events -----------------------------------------------------------------
+
+  server.registerTool(
+    'watch_events',
+    {
+      title: 'Watch document events',
+      description:
+        'Subscribe to the document’s realtime event stream and return events (comments, suggestions, reviews, @mentions, edits) until the timeout or max count is reached — instead of polling.',
+      inputSchema: {
+        ...docId,
+        timeoutMs: z
+          .number()
+          .int()
+          .optional()
+          .describe('Max time to wait for events in ms (default 25000).'),
+        max: z
+          .number()
+          .int()
+          .optional()
+          .describe('Stop after this many events (default 50).'),
+      },
+    },
+    (a) =>
+      run(() =>
+        client.watchEvents(a.docId, { timeoutMs: a.timeoutMs, max: a.max }),
+      ),
+  );
+
   // --- History ----------------------------------------------------------------
 
   server.registerTool(
     'list_versions',
     {
       title: 'List versions',
-      description: 'List a document’s saved edit-history versions (id, time, size).',
+      description: 'List a document’s saved edit-history versions (id, time, size, name, author).',
       inputSchema: { ...docId },
     },
     (a) => run(() => client.listVersions(a.docId)),
@@ -350,5 +482,12 @@ export const TOOL_NAMES = [
   'accept_suggestion',
   'reject_suggestion',
   'reply_suggestion',
+  'review_suggestions',
+  'find_replace',
+  'multi_edit',
+  'watch_events',
+  'git_status',
+  'git_commit',
+  'git_branch',
   'list_versions',
 ] as const;

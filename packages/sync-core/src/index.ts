@@ -1,4 +1,6 @@
 export { applyStringToYText, CONTENT_FIELD } from './ytext.js';
+export { applyEdits, findReplaceEdits } from './edits.js';
+export type { RangeEdit, FindReplaceOptions } from './edits.js';
 export { colorForSeed, makePresence } from './presence.js';
 export { lineDiff, mapOffsetThroughDiff } from './diff.js';
 export type { LineDiffChunk, LineDiffOp } from './diff.js';

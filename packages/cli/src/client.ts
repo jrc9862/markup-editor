@@ -4,8 +4,10 @@ import {
   HocuspocusProviderWebsocket,
 } from '@hocuspocus/provider';
 import WebSocket from 'ws';
-import { CONTENT_FIELD } from '@markup/sync-core';
+import { CONTENT_FIELD, applyStringToYText } from '@markup/sync-core';
 import { SERVER_WS, TOKEN } from './config.js';
+import { loadState, saveState } from './state.js';
+import { DISK_ORIGIN } from './daemon.js';
 
 export interface DocConnection {
   ydoc: Y.Doc;
@@ -14,10 +16,36 @@ export interface DocConnection {
   close: () => void;
 }
 
+export interface ConnectOptions {
+  /**
+   * Persist/restore the Yjs doc under .markup/state so offline edits survive a
+   * restart and CRDT-merge on reconnect instead of being lost to server-wins.
+   */
+  persist?: boolean;
+  /**
+   * Disk content to fold into the doc *before* connecting, so edits made while
+   * offline are part of the initial sync and three-way-merge with the server.
+   * Only meaningful alongside `persist` (we need a persisted base to diff
+   * against — see index.ts for the cold-start guard).
+   */
+  seedDisk?: string;
+}
+
 /** Connect to a document room as a headless Yjs client and wait for sync. */
-export function connectDoc(docId: string): Promise<DocConnection> {
+export function connectDoc(
+  docId: string,
+  opts: ConnectOptions = {},
+): Promise<DocConnection> {
   return new Promise((resolve, reject) => {
     const ydoc = new Y.Doc();
+
+    // Restore last-known state (offline edits + last server state) before
+    // connecting, so the provider's initial sync merges it with the server.
+    if (opts.persist) loadState(ydoc, docId);
+    if (opts.seedDisk !== undefined) {
+      applyStringToYText(ydoc.getText(CONTENT_FIELD), opts.seedDisk, DISK_ORIGIN);
+    }
+
     // Node has no browser WebSocket; hand the provider the 'ws' polyfill
     // via an explicit websocket transport.
     const socket = new HocuspocusProviderWebsocket({
@@ -31,6 +59,16 @@ export function connectDoc(docId: string): Promise<DocConnection> {
       token: TOKEN,
     });
 
+    // Keep the on-disk snapshot current so a later offline session has a fresh
+    // base to merge from.
+    let saveTimer: NodeJS.Timeout | null = null;
+    const persistObserver = () => {
+      if (!opts.persist) return;
+      if (saveTimer) clearTimeout(saveTimer);
+      saveTimer = setTimeout(() => saveState(ydoc, docId), 250);
+    };
+    if (opts.persist) ydoc.on('update', persistObserver);
+
     const timeout = setTimeout(() => {
       provider.destroy();
       reject(new Error(`timed out syncing doc ${docId}`));
@@ -38,11 +76,15 @@ export function connectDoc(docId: string): Promise<DocConnection> {
 
     provider.on('synced', () => {
       clearTimeout(timeout);
+      if (opts.persist) saveState(ydoc, docId);
       resolve({
         ydoc,
         ytext: ydoc.getText(CONTENT_FIELD),
         provider,
         close: () => {
+          if (saveTimer) clearTimeout(saveTimer);
+          if (opts.persist) saveState(ydoc, docId);
+          ydoc.off('update', persistObserver);
           provider.destroy();
           socket.destroy();
           ydoc.destroy();
