@@ -34,6 +34,9 @@ import RenderedEditor from './RenderedEditor';
 import Toolbar from './Toolbar';
 import FloatingAnnotations from './FloatingAnnotations';
 import HistoryPanel from './HistoryPanel';
+import FindReplacePanel from './FindReplacePanel';
+import GitPanel from './GitPanel';
+import ReviewPanel from './ReviewPanel';
 import type { EditorHandle } from './format';
 import type { SuggestionStore } from './suggestMode';
 
@@ -117,6 +120,16 @@ export default function Editor({ docId }: { docId: string }) {
   const [selection, setSelection] = useState<Range | null>(null);
   const [composer, setComposer] = useState<'comment' | 'suggest' | null>(null);
   const [showHistory, setShowHistory] = useState(false);
+  const [showFind, setShowFind] = useState(false);
+  const [showGit, setShowGit] = useState(false);
+  const [showReview, setShowReview] = useState(false);
+  // Local-only read-only preview of a past version (roadmap #9): visible to
+  // just this user, no diff, no effect on other collaborators.
+  const [preview, setPreview] = useState<{
+    id: number;
+    label: string;
+    content: string;
+  } | null>(null);
   // Realtime suggestion mode (source mode): keystrokes become suggestions.
   const [suggesting, setSuggesting] = useState(false);
   // Bumped whenever floating-card positions may have shifted.
@@ -202,9 +215,12 @@ export default function Editor({ docId }: { docId: string }) {
   // Once the signed-in identity is known, presence uses the real name
   // (the provider starts with the guest name before /api/me resolves).
   useEffect(() => {
-    if (!conn || me?.kind !== 'user') return;
-    if (conn.user.name === me.user!.name) return;
-    const user = makePresence(me.user!.name);
+    if (!conn || !me?.user) return;
+    if (conn.user.name === me.user.name) return;
+    const user = makePresence(
+      me.user.name,
+      me.kind === 'agent' ? 'agent' : 'human',
+    );
     conn.provider.setAwarenessField('user', user);
     setConn({ ...conn, user });
   }, [me, conn]);
@@ -262,6 +278,29 @@ export default function Editor({ docId }: { docId: string }) {
 
   const copyLink = () => {
     navigator.clipboard.writeText(window.location.href).catch(() => {});
+  };
+
+  // Rename the doc from the topbar. The path's final segment is kept in sync
+  // with the name so the directory-tree browser stays consistent.
+  const renameDocFromUI = () => {
+    if (!meta) return;
+    const current = (meta.path ?? meta.name).split('/').pop() ?? meta.name;
+    const next = window.prompt('Rename document', current);
+    if (!next || !next.trim() || next === current) return;
+    const name = next.trim();
+    const segs = (meta.path ?? meta.name).split('/');
+    segs[segs.length - 1] = name;
+    const path = segs.join('/');
+    fetch(`${SERVER_HTTP}/api/docs/${docId}`, {
+      method: 'PATCH',
+      headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ name, path }),
+    })
+      .then(async (r) => {
+        if (r.ok) setMeta((await r.json()) as DocMeta);
+      })
+      .catch(() => {});
   };
 
   // --- annotation actions ----------------------------------------------------
@@ -495,7 +534,15 @@ export default function Editor({ docId }: { docId: string }) {
           ⌘
         </a>
         <div className="doc-title">
-          <span className="doc-name">{meta?.path ?? meta?.name ?? docId}</span>
+          <span
+            className="doc-name"
+            role={canEdit ? 'button' : undefined}
+            title={canEdit ? 'Click to rename' : undefined}
+            style={canEdit ? { cursor: 'pointer' } : undefined}
+            onClick={canEdit ? renameDocFromUI : undefined}
+          >
+            {meta?.path ?? meta?.name ?? docId}
+          </span>
           <span className={`conn-dot ${connected ? 'on' : ''}`} />
           <span className="conn-label">{connected ? 'live' : 'connecting…'}</span>
         </div>
@@ -504,11 +551,11 @@ export default function Editor({ docId }: { docId: string }) {
           {peers.map((p, i) => (
             <span
               key={i}
-              className="avatar"
+              className={`avatar ${p.kind === 'agent' ? 'agent' : ''}`}
               style={{ background: p.color }}
-              title={p.name}
+              title={p.kind === 'agent' ? `${p.name} (agent)` : p.name}
             >
-              {p.name.slice(0, 2).toUpperCase()}
+              {p.kind === 'agent' ? '🤖' : p.name.slice(0, 2).toUpperCase()}
             </span>
           ))}
           {conn && !signedIn && (
@@ -546,6 +593,36 @@ export default function Editor({ docId }: { docId: string }) {
           ⏱ History
         </button>
 
+        {canEdit && (
+          <button
+            className={`ghost-btn history-toggle ${showFind ? 'on' : ''}`}
+            title="Find & replace"
+            onClick={() => setShowFind((v) => !v)}
+          >
+            ⇄ Replace
+          </button>
+        )}
+
+        {canEdit && (
+          <button
+            className={`ghost-btn history-toggle ${showReview ? 'on' : ''}`}
+            title="Review suggestions"
+            onClick={() => setShowReview((v) => !v)}
+          >
+            ✓ Review
+          </button>
+        )}
+
+        {canEdit && (
+          <button
+            className={`ghost-btn history-toggle ${showGit ? 'on' : ''}`}
+            title="Git"
+            onClick={() => setShowGit((v) => !v)}
+          >
+            ⎇ Git
+          </button>
+        )}
+
         {!canEdit && <span className="role-badge">{myRole}</span>}
         <SharePanel docId={docId} isOwner={myRole === 'owner'} onCopyLink={copyLink} />
       </header>
@@ -567,11 +644,31 @@ export default function Editor({ docId }: { docId: string }) {
         onSuggest={() => setComposer('suggest')}
       />
 
+      {showFind && conn && canEdit && (
+        <FindReplacePanel ytext={conn.ytext} onClose={() => setShowFind(false)} />
+      )}
+
       <div className="workspace">
         <main className="page-area">
           <div className="doc-row">
             <div className="page">
-              {!synced || !conn ? (
+              {preview ? (
+                <div className="version-preview">
+                  <div className="version-preview-bar">
+                    <span>
+                      Previewing <strong>{preview.label}</strong> — read-only,
+                      visible only to you
+                    </span>
+                    <button
+                      className="ghost-btn"
+                      onClick={() => setPreview(null)}
+                    >
+                      Exit preview
+                    </button>
+                  </div>
+                  <pre className="version-preview-body">{preview.content}</pre>
+                </div>
+              ) : !synced || !conn ? (
                 <p className="loading">Loading document…</p>
               ) : mode === 'source' ? (
                 <SourceEditor
@@ -667,10 +764,29 @@ export default function Editor({ docId }: { docId: string }) {
         {showHistory && conn && (
           <HistoryPanel
             docId={docId}
-            currentContent={() => conn.ytext.toString()}
-            onClose={() => setShowHistory(false)}
+            liveTick={layoutTick}
+            previewingId={preview?.id ?? null}
+            onPreview={(v, content) =>
+              setPreview({ id: v.id, label: v.name ?? `v${v.id}`, content })
+            }
+            onExitPreview={() => setPreview(null)}
+            onClose={() => {
+              setShowHistory(false);
+              setPreview(null);
+            }}
           />
         )}
+
+        {showReview && conn && (
+          <ReviewPanel
+            docId={docId}
+            open={mergedSuggestions.filter((s) => s.status === 'open')}
+            onClose={() => setShowReview(false)}
+            onApplied={() => {}}
+          />
+        )}
+
+        {showGit && conn && <GitPanel onClose={() => setShowGit(false)} />}
       </div>
     </div>
   );

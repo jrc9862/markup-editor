@@ -125,6 +125,11 @@ button { font-family: inherit; cursor: pointer; }
   border: none;
 }
 
+.avatar.agent {
+  border-style: dashed;
+  font-size: 13px;
+}
+
 .mode-toggle {
   display: flex;
   border: 1px solid var(--chrome-border);
@@ -656,6 +661,63 @@ button { font-family: inherit; cursor: pointer; }
 
 .card.version .mono { font-family: var(--mono); font-size: 12.5px; }
 
+.version-meta {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 0 2px 4px;
+}
+
+.version-author {
+  font-size: 11px;
+  color: var(--accent);
+  font-family: var(--mono);
+}
+
+.card.version.previewing {
+  outline: 1px solid var(--accent);
+}
+
+.version-group {
+  margin-bottom: 10px;
+}
+
+.version-group-head {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  padding: 4px 2px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 4px;
+}
+
+.version-group .card.version {
+  margin-left: 8px;
+}
+
+.version-preview-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  background: var(--surface-hover);
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.version-preview-body {
+  margin: 0;
+  padding: 24px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--fg);
+}
+
 .diff-view {
   margin-top: 8px;
   border: 1px solid var(--border);
@@ -719,6 +781,134 @@ button { font-family: inherit; cursor: pointer; }
 .tree-file:hover { background: var(--surface-hover); color: var(--accent); }
 
 .tree-filename::before { content: '◦ '; color: var(--muted); }
+
+.tree-file-row {
+  display: flex;
+  align-items: center;
+}
+
+.tree-file-row .tree-file { flex: 1; }
+
+.tree-rename {
+  visibility: hidden;
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 5px 8px;
+  font-size: 13px;
+}
+
+.tree-file-row:hover .tree-rename { visibility: visible; }
+.tree-rename:hover { color: var(--accent); }
+
+/* --- Find & replace ------------------------------------------------------------ */
+
+.find-replace {
+  position: absolute;
+  top: 56px;
+  right: 16px;
+  z-index: 20;
+  width: 280px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+}
+
+.find-replace-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.find-input {
+  width: 100%;
+  padding: 6px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: 12.5px;
+}
+
+.find-opts {
+  display: flex;
+  gap: 14px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.find-actions {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.find-count {
+  font-size: 11.5px;
+  color: var(--muted);
+  font-family: var(--mono);
+}
+
+.find-status {
+  font-size: 11.5px;
+  color: var(--accent);
+  font-family: var(--mono);
+}
+
+/* --- Git panel ----------------------------------------------------------------- */
+
+.git-branch { font-size: 12px; color: var(--muted); padding: 4px 2px; }
+
+.git-files { margin: 6px 0; }
+
+.git-file {
+  display: flex;
+  gap: 8px;
+  font-size: 12px;
+  padding: 2px 2px;
+}
+
+.git-stat { color: var(--accent); min-width: 18px; }
+.git-path { word-break: break-all; }
+
+.git-branches { margin-top: 10px; display: flex; flex-direction: column; gap: 4px; }
+
+.git-branch-row { display: flex; gap: 6px; }
+
+.git-branch-item {
+  text-align: left;
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 4px 8px;
+  cursor: pointer;
+}
+
+.git-branch-item.on { color: var(--accent); border-color: var(--accent); cursor: default; }
+.git-branch-item:hover:not(.on) { background: var(--surface-hover); }
+
+/* --- Review panel -------------------------------------------------------------- */
+
+.review-bulk { display: flex; gap: 6px; margin-bottom: 8px; }
+
+.review-item { display: flex; flex-direction: column; gap: 6px; }
+
+.review-author { font-size: 11px; color: var(--accent); }
+
+.review-diff { font-size: 12.5px; display: flex; flex-direction: column; gap: 2px; }
+.review-diff del { color: var(--red); text-decoration: line-through; }
+.review-diff ins { color: var(--green); text-decoration: none; }
+
+.review-actions { display: flex; gap: 6px; }
+
+.pick-accept { color: var(--green); border-color: var(--green); }
+.pick-reject { color: var(--red); border-color: var(--red); }
 
 /* --- Doc list (home) ----------------------------------------------------------- */
 

@@ -111,6 +111,21 @@ function metaStoreContract(makeStore: () => Promise<MetaStore>) {
     expect(await store.removeAclRole('doc-acl', 'u-9')).toBe(false);
   });
 
+  it('renames a doc (name and/or path), leaving omitted fields intact', async () => {
+    await store.create('doc-mv', 'old.md', 'dir/old.md');
+    const renamed = await store.rename('doc-mv', {
+      name: 'new.md',
+      path: 'dir/new.md',
+    });
+    expect(renamed).toMatchObject({ name: 'new.md', path: 'dir/new.md' });
+
+    // Partial update: only the name changes, path is preserved.
+    const partial = await store.rename('doc-mv', { name: 'newer.md' });
+    expect(partial).toMatchObject({ name: 'newer.md', path: 'dir/new.md' });
+
+    expect(await store.rename('missing', { name: 'x' })).toBeUndefined();
+  });
+
   it('debounces version snapshots', async () => {
     expect(await store.maybeAddVersion('doc-1', 'v1', 0)).toBe(true);
     // identical content → no new version, regardless of interval
@@ -126,6 +141,22 @@ function metaStoreContract(makeStore: () => Promise<MetaStore>) {
     expect(versions[0].size).toBe(2);
     expect(await store.getVersionContent('doc-1', versions[1].id)).toBe('v1');
     expect(await store.getVersionContent('doc-1', 9999)).toBeUndefined();
+  });
+
+  it('records version attribution and names', async () => {
+    await store.create('doc-attr', 'attr.md');
+    expect(
+      await store.maybeAddVersion('doc-attr', 'hello', 0, 'Ada', 'u-1'),
+    ).toBe(true);
+    const [v] = await store.listVersions('doc-attr');
+    expect(v.author).toBe('Ada');
+    expect(v.authorId).toBe('u-1');
+    expect(v.name).toBeUndefined();
+
+    expect(await store.nameVersion('doc-attr', v.id, 'first draft')).toBe(true);
+    expect(await store.nameVersion('doc-attr', 9999, 'nope')).toBe(false);
+    const [named] = await store.listVersions('doc-attr');
+    expect(named.name).toBe('first draft');
   });
 }
 

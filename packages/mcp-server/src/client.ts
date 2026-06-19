@@ -147,8 +147,97 @@ export class MarkupClient {
     });
   }
 
+  // --- Multi-edits -----------------------------------------------------------
+  /** Batch find/replace or an explicit list of range edits, applied atomically. */
+  multiEdit(
+    docId: string,
+    body:
+      | { find: string; replace: string; regex?: boolean; caseSensitive?: boolean }
+      | { edits: Array<{ from: number; to: number; insert: string }> },
+  ) {
+    return this.json('POST', `/api/docs/${docId}/edits`, body);
+  }
+
+  /** PR-style batch review: accept and/or reject open suggestions atomically. */
+  reviewSuggestions(docId: string, accept: string[], reject: string[]) {
+    return this.json('POST', `/api/docs/${docId}/suggestions/review`, {
+      accept,
+      reject,
+    });
+  }
+
+  // --- Git-native flows ------------------------------------------------------
+  gitStatus() {
+    return this.json('GET', '/api/git/status');
+  }
+  gitCommit(message: string, paths?: string[]) {
+    return this.json('POST', '/api/git/commit', { message, paths });
+  }
+  gitBranch(name: string, checkout = true) {
+    return this.json('POST', '/api/git/branch', { name, checkout });
+  }
+
   // --- History ---------------------------------------------------------------
   listVersions(docId: string) {
     return this.json('GET', `/api/docs/${docId}/versions`);
+  }
+
+  // --- Events (SSE) ----------------------------------------------------------
+  /**
+   * Subscribe to the doc's realtime event stream and collect events until
+   * `timeoutMs` elapses or `max` events arrive — the polling-free way for an
+   * agent to react to comments, suggestions, reviews, and mentions.
+   */
+  async watchEvents(
+    docId: string,
+    opts: { timeoutMs?: number; max?: number } = {},
+  ): Promise<unknown[]> {
+    const timeoutMs = opts.timeoutMs ?? 25_000;
+    const max = opts.max ?? 50;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    const events: unknown[] = [];
+    try {
+      const res = await fetch(`${this.cfg.server}/api/docs/${docId}/events`, {
+        headers: {
+          Authorization: `Bearer ${this.cfg.token}`,
+          Accept: 'text/event-stream',
+        },
+        signal: ctrl.signal,
+      });
+      if (!res.ok || !res.body) {
+        throw new MarkupError(
+          `GET /api/docs/${docId}/events -> ${res.status}`,
+          res.status,
+        );
+      }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      while (events.length < max) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const frames = buf.split('\n\n');
+        buf = frames.pop() ?? '';
+        for (const frame of frames) {
+          for (const line of frame.split('\n')) {
+            if (line.startsWith('data:')) {
+              try {
+                events.push(JSON.parse(line.slice(5).trim()));
+              } catch {
+                // skip heartbeats / malformed frames
+              }
+            }
+          }
+        }
+      }
+    } catch (e) {
+      if (!(e instanceof Error && e.name === 'AbortError')) throw e;
+    } finally {
+      clearTimeout(timer);
+      ctrl.abort();
+    }
+    return events;
   }
 }
