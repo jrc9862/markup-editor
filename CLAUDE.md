@@ -196,7 +196,12 @@ bearer), `MARKUP_RATE_WINDOW_MS`/`MARKUP_RATE_MAX` (`/api`+`/auth` rate limit,
 per-principal else per-IP; `MARKUP_RATE_MAX=0` disables), `MARKUP_MAX_DOC_BYTES`
 (reject content-growing writes over this, default 2 MB; `0` disables),
 `MARKUP_MAX_CONNECTIONS_PER_USER` (WS cap per authenticated principal, default
-20; `0` = unlimited). `NEXT_PUBLIC_*` values are inlined into the web bundle at
+20; `0` = unlimited), `MARKUP_VERSION_RETENTION_MAX` (max `doc_versions`
+snapshots kept per doc, default 500; `0` disables the count cap) /
+`MARKUP_VERSION_RETENTION_DAYS` (prune versions older than N days, default `0`
+= off) — retention never drops a user-named version or a doc's most-recent
+snapshot, and runs after each new snapshot plus a one-shot startup sweep.
+`NEXT_PUBLIC_*` values are inlined into the web bundle at
 **build time** — for a deployed web image they are Docker build args, not
 runtime env.
 The web app builds with `output: 'standalone'`; its Docker image runs the
@@ -365,9 +370,12 @@ way), mono accents (CSS vars in `globals.css`).
    Remaining: workspace membership, SAML/SCIM.
 2. **Enterprise Phase 2 (scale/ops)** — observability + self-protection
    limits shipped (structured logs, `/metrics`, `/readyz`, REST rate limiting,
-   per-user WS caps, doc byte-size guard). Remaining: Redis multi-node (incl.
-   moving the in-process `docEvents` bus + `lastEditor` map onto Redis pub/sub),
-   backups + Yjs compaction, k6 load testing (see ENTERPRISE_PLAN.md).
+   per-user WS caps, doc byte-size guard); plus history retention + backups
+   (`doc_versions` count/age caps that spare named + latest snapshots,
+   `scripts/backup.sh` for pg_dump/SQLite `.backup`). Yjs state is a single
+   GC'd snapshot per doc (no update log to compact). Remaining: Redis
+   multi-node (incl. moving the in-process `docEvents` bus + `lastEditor` map
+   onto Redis pub/sub), k6 load testing (see ENTERPRISE_PLAN.md, PHASE2_OPS.md).
 
 Shipped from the original roadmap: togglable realtime suggestion mode
 (both source and rendered modes), in-rendered-view annotation highlights,
