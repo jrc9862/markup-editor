@@ -93,6 +93,8 @@ export interface MetaStore {
   listAcl(docId: string): Promise<AclEntry[]>;
   setLinkRole(docId: string, role: DocRole | 'none'): Promise<void>;
 
+  /** Readiness probe: round-trips a trivial query, throws if unreachable. */
+  ping(): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -497,6 +499,10 @@ export class SqliteMetaStore implements MetaStore {
     this.db
       .prepare('UPDATE doc_meta SET link_role = ? WHERE doc_id = ?')
       .run(role, docId);
+  }
+
+  async ping(): Promise<void> {
+    this.db.prepare('SELECT 1').get();
   }
 
   async close(): Promise<void> {

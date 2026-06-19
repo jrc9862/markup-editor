@@ -4,6 +4,8 @@ import { Database as DatabaseExtension } from '@hocuspocus/extension-database';
 import pg from 'pg';
 import express from 'express';
 import cors from 'cors';
+import { pinoHttp } from 'pino-http';
+import { rateLimit, ipKeyGenerator } from 'express-rate-limit';
 import { WebSocketServer } from 'ws';
 import { v4 as uuidv4 } from 'uuid';
 import type * as Y from 'yjs';
@@ -45,6 +47,17 @@ import {
   fetchYjsState,
   storeYjsState,
 } from './db-postgres.js';
+import { logger } from './logger.js';
+import {
+  registry,
+  wsConnections,
+  docsLoaded,
+  docUpdates,
+  persistDuration,
+  httpDuration,
+} from './metrics.js';
+import { connections } from './connections.js';
+import { exceedsByteLimit, applyRangeEditsToString } from './limits.js';
 
 const PORT = Number(process.env.PORT ?? 4000);
 const TOKEN = process.env.MARKUP_TOKEN ?? 'dev-token';
@@ -57,6 +70,14 @@ const REQUIRE_AUTH = process.env.MARKUP_REQUIRE_AUTH === '1';
 const LEGACY_TOKEN = REQUIRE_AUTH ? undefined : TOKEN;
 const SERVER_ORIGIN =
   process.env.MARKUP_SERVER_ORIGIN ?? `http://localhost:${PORT}`;
+// Self-protection limits (Phase 2). Generous defaults; 0 disables.
+const MAX_DOC_BYTES = Number(process.env.MARKUP_MAX_DOC_BYTES ?? 2_000_000);
+const MAX_CONN_PER_USER = Number(
+  process.env.MARKUP_MAX_CONNECTIONS_PER_USER ?? 20,
+);
+const RATE_WINDOW_MS = Number(process.env.MARKUP_RATE_WINDOW_MS ?? 60_000);
+const RATE_MAX = Number(process.env.MARKUP_RATE_MAX ?? 600);
+const METRICS_TOKEN = process.env.MARKUP_METRICS_TOKEN;
 const OIDC = oidcFromEnv(SERVER_ORIGIN);
 // Git-native flows are enabled only when the server can reach a working tree
 // (MARKUP_REPO_DIR) — the self-hosted/local shape. Otherwise the routes 404.
@@ -123,17 +144,41 @@ const hocuspocus = Hocuspocus.configure({
     // incoming doc updates server-side. Suggester/commenter roles act
     // through the REST surface instead.
     if (!scopeAllows(scope, 'write')) connection.readOnly = true;
+    const label = principalLabel(principal);
+    // Per-user connection cap: reserve a slot for authenticated principals
+    // (legacy/anonymous have no stable id and are exempt). Released in
+    // onDisconnect. Acquire last so a rejection here doesn't leak a slot.
+    if (label.authorId && !connections.tryAcquire(label.authorId, MAX_CONN_PER_USER)) {
+      throw new Error('connection limit reached');
+    }
+    wsConnections.inc();
     // The returned value becomes the connection context; onChange uses it to
     // attribute the resulting version snapshot.
-    return principalLabel(principal);
+    return label;
+  },
+
+  async onDisconnect({ context }) {
+    wsConnections.dec();
+    const c = context as { authorId?: string } | undefined;
+    if (c?.authorId) connections.release(c.authorId);
+  },
+
+  async onLoadDocument() {
+    docsLoaded.inc();
+  },
+
+  async afterUnloadDocument() {
+    docsLoaded.dec();
   },
 
   async onChange({ documentName, context }) {
+    docUpdates.inc();
     const c = context as { author?: string; authorId?: string } | undefined;
     if (c?.author) lastEditor.set(documentName, c);
   },
 
   async onStoreDocument({ documentName, document }) {
+    const done = persistDuration.startTimer();
     await meta.touch(documentName);
     // Edit history: snapshot the markdown, debounced inside maybeAddVersion
     // so active typing doesn't create a version per save. Stamp the snapshot
@@ -147,22 +192,101 @@ const hocuspocus = Hocuspocus.configure({
       editor?.author,
       editor?.authorId,
     );
+    done();
   },
 });
 
 // --- REST API ---------------------------------------------------------------
 
 const app = express();
+// Structured request logging (Phase 2). Attaches the resolved principal to
+// each completed request once the /api guard sets res.locals.principal.
+app.use(
+  pinoHttp({
+    logger,
+    customProps: (_req, res) => {
+      const p = (res as express.Response).locals?.principal as
+        | Principal
+        | undefined;
+      return p
+        ? {
+            principalKind: p.kind,
+            principalId: p.kind === 'legacy' ? undefined : p.user.id,
+          }
+        : {};
+    },
+  }),
+);
+// REST latency histogram, labelled by the matched route pattern (low
+// cardinality — docIds stay as `:docId`, not literal values).
+app.use((req, res, next) => {
+  const done = httpDuration.startTimer();
+  res.on('finish', () => {
+    const route = `${req.baseUrl}${req.route?.path ?? ''}` || req.path;
+    done({ method: req.method, route, status: res.statusCode });
+  });
+  next();
+});
 // Credentialed CORS for the web app; non-browser clients (CLI, agents via
 // curl) are unaffected by CORS.
 app.use(cors({ origin: WEB_ORIGIN, credentials: true }));
 app.use(express.json({ limit: '10mb' }));
 
+// Liveness: the process is up and serving. Used by container orchestration to
+// decide whether to restart the pod.
 app.get('/healthz', (_req, res) => {
   res.json({ ok: true });
 });
 
-// Sign-in/out lives outside the /api guard.
+// Readiness: the process can serve traffic right now. Fails during shutdown
+// (so the LB drains us before connections close) and if the store is
+// unreachable. Used by the LB to decide whether to route requests.
+app.get('/readyz', async (_req, res) => {
+  if (shuttingDown) {
+    res.status(503).json({ ready: false, reason: 'shutting down' });
+    return;
+  }
+  try {
+    await meta.ping();
+    res.json({ ready: true });
+  } catch (err) {
+    logger.error({ err }, 'readiness check failed');
+    res.status(503).json({ ready: false, reason: 'store unreachable' });
+  }
+});
+
+// Prometheus scrape target. Outside /api (no per-doc auth); optionally gated
+// by a bearer when MARKUP_METRICS_TOKEN is set, otherwise restrict at the
+// network layer as usual for an internal endpoint.
+app.get('/metrics', async (req, res) => {
+  if (METRICS_TOKEN && req.headers.authorization !== `Bearer ${METRICS_TOKEN}`) {
+    res.status(401).end();
+    return;
+  }
+  res.type(registry.contentType).send(await registry.metrics());
+});
+
+// Rate limiting (Phase 2): per authenticated user when known, else per client
+// IP. SSE streams are long-lived single requests, so they're exempt. Disabled
+// when MARKUP_RATE_MAX <= 0.
+const apiLimiter = rateLimit({
+  windowMs: RATE_WINDOW_MS,
+  limit: RATE_MAX,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  skip: (req) => RATE_MAX <= 0 || req.path.endsWith('/events'),
+  keyGenerator: (req, res) => {
+    const p = (res as express.Response).locals?.principal as
+      | Principal
+      | undefined;
+    if (p && p.kind !== 'legacy') return `u:${p.user.id}`;
+    return ipKeyGenerator(req.ip ?? '');
+  },
+});
+
+// Sign-in/out lives outside the /api guard; rate-limited by IP (no principal
+// yet at sign-in time).
+app.use('/auth', apiLimiter);
 registerAuthRoutes(app, meta, {
   oidc: OIDC,
   webOrigin: WEB_ORIGIN,
@@ -185,6 +309,9 @@ app.use('/api', async (req, res, next) => {
   res.locals.principal = principal;
   next();
 });
+
+// Applied after the guard so the limiter can key by resolved principal.
+app.use('/api', apiLimiter);
 
 /** Per-route scope check (scopes are ordered; see auth.ts). */
 const needs =
@@ -275,6 +402,10 @@ app.post('/api/docs', needs('write'), async (req, res) => {
   const body = req.body as CreateDocRequest;
   if (!body?.name) {
     res.status(400).json({ error: 'name is required' });
+    return;
+  }
+  if (body.content && tooLarge(body.content)) {
+    res.status(413).json({ error: 'document too large' });
     return;
   }
   const docId = uuidv4();
@@ -428,11 +559,19 @@ function resolveRange(
   return null;
 }
 
+/** Reject content over the configured byte budget (see limits.ts). */
+const tooLarge = (content: string): boolean =>
+  exceedsByteLimit(content, MAX_DOC_BYTES);
+
 /** Direct write: reconcile the whole document to the provided markdown. */
 app.put('/api/docs/:docId/content', needs('write'), docAccess('write'), async (req, res) => {
   const { content } = req.body as { content?: string };
   if (typeof content !== 'string') {
     res.status(400).json({ error: 'content (string) is required' });
+    return;
+  }
+  if (tooLarge(content)) {
+    res.status(413).json({ error: 'document too large' });
     return;
   }
   await withDoc(req.params.docId, (doc) =>
@@ -486,13 +625,16 @@ app.post('/api/docs/:docId/edits', needs('write'), docAccess('write'), async (re
           caseSensitive: body.caseSensitive,
         });
     try {
+      if (tooLarge(applyRangeEditsToString(ytext.toString(), edits))) {
+        return { error: 'document too large', tooLarge: true };
+      }
       return { applied: applyEdits(ytext, edits) };
     } catch (err) {
       return { error: err instanceof Error ? err.message : 'invalid edits' };
     }
   });
   if ('error' in result) {
-    res.status(400).json(result);
+    res.status('tooLarge' in result ? 413 : 400).json({ error: result.error });
     return;
   }
   lastEditor.set(req.params.docId, principalLabel(res.locals.principal as Principal));
@@ -1063,10 +1205,15 @@ app.post('/api/docs/:docId/restore', needs('write'), docAccess('write'), async (
 // --- Single port: HTTP for REST, WS upgrade for Yjs sync --------------------
 
 const httpServer = app.listen(PORT, () => {
-  console.log(`markup server listening on http://localhost:${PORT}`);
-  console.log(`  storage:        ${pool ? 'postgres' : `sqlite (${DATA_DIR})`}`);
-  console.log(`  WS (Yjs sync):  ws://localhost:${PORT}`);
-  console.log(`  REST:           http://localhost:${PORT}/api`);
+  logger.info(
+    {
+      port: PORT,
+      storage: pool ? 'postgres' : `sqlite (${DATA_DIR})`,
+      ws: `ws://localhost:${PORT}`,
+      rest: `http://localhost:${PORT}/api`,
+    },
+    'markup server listening',
+  );
 });
 
 const wss = new WebSocketServer({ noServer: true });
@@ -1082,14 +1229,14 @@ let shuttingDown = false;
 async function shutdown(signal: string) {
   if (shuttingDown) return;
   shuttingDown = true;
-  console.log(`${signal} received, flushing documents...`);
+  logger.info({ signal }, 'shutdown: flushing documents');
   httpServer.close();
   try {
     await hocuspocus.destroy();
     // meta.close() also ends the shared pg pool in the Postgres case.
     await meta.close();
   } catch (err) {
-    console.error('error during shutdown', err);
+    logger.error({ err }, 'error during shutdown');
     process.exit(1);
   }
   process.exit(0);

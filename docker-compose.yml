@@ -40,6 +40,20 @@ services:
       MARKUP_TOKEN: ${MARKUP_TOKEN:-dev-token}
     ports:
       - '4000:4000'
+    # Readiness gate (Phase 2): /readyz fails until the store is reachable and
+    # flips to 503 during graceful shutdown. The image has no curl, so probe
+    # with node. web waits on this before starting.
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "require('http').get('http://localhost:4000/readyz',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     depends_on:
       postgres:
         condition: service_healthy
@@ -55,7 +69,8 @@ services:
     ports:
       - '3000:3000'
     depends_on:
-      - server
+      server:
+        condition: service_healthy
 
 volumes:
   pgdata:
