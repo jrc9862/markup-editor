@@ -37,6 +37,8 @@ export interface CreateDocRequest {
 export interface PresenceUser {
   name: string;
   color: string;
+  /** 'agent' renders an agent badge in presence; defaults to a human. */
+  kind?: 'human' | 'agent';
 }
 
 /** Metadata for a stored document version (edit history). */

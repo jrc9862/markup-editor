@@ -38,6 +38,7 @@ import {
 } from './auth.js';
 import { registerAuthRoutes, registerTokenRoutes } from './auth-routes.js';
 import { oidcFromEnv } from './oidc.js';
+import { docEvents, extractMentions, type DocEvent } from './events.js';
 import {
   PostgresMetaStore,
   fetchYjsState,
@@ -208,6 +209,36 @@ function authorOf(
     return { author: bodyAuthor ?? p.tokenName, authorId: p.user.id };
   }
   return bodyAuthor ? { author: bodyAuthor } : null;
+}
+
+/**
+ * Publish a realtime doc event (consumed by SSE subscribers), stamping the
+ * timestamp and whether the actor is an agent principal.
+ */
+function publish(
+  res: express.Response,
+  docId: string,
+  ev: Omit<DocEvent, 'docId' | 'ts' | 'agent'>,
+): void {
+  const p = res.locals.principal as Principal;
+  docEvents.publish({
+    docId,
+    ts: new Date().toISOString(),
+    agent: p.kind === 'agent',
+    ...ev,
+  });
+}
+
+/** Emit a mention event for each @handle found in `text`. */
+function publishMentions(
+  res: express.Response,
+  docId: string,
+  text: string,
+  who: { author: string; authorId?: string },
+): void {
+  for (const mention of extractMentions(text)) {
+    publish(res, docId, { type: 'mention', mention, text, ...who });
+  }
 }
 
 /**
@@ -405,6 +436,7 @@ app.put('/api/docs/:docId/content', needs('write'), docAccess('write'), async (r
   );
   // Direct (REST) writes carry no WS context, so attribute the snapshot here.
   lastEditor.set(req.params.docId, principalLabel(res.locals.principal as Principal));
+  publish(res, req.params.docId, { type: 'content' });
   res.json({ ok: true });
 });
 
@@ -460,6 +492,7 @@ app.post('/api/docs/:docId/edits', needs('write'), docAccess('write'), async (re
     return;
   }
   lastEditor.set(req.params.docId, principalLabel(res.locals.principal as Principal));
+  publish(res, req.params.docId, { type: 'content' });
   res.json(result);
 });
 
@@ -484,6 +517,8 @@ app.post('/api/docs/:docId/comments', needs('comment'), docAccess('comment'), as
     res.status(400).json({ error: 'range not found (from/to or anchorText)' });
     return;
   }
+  publish(res, req.params.docId, { type: 'comment', threadId: result, text: body.text, ...who });
+  publishMentions(res, req.params.docId, body.text, who);
   res.status(201).json({ id: result });
 });
 
@@ -501,6 +536,13 @@ app.post(
     await withDoc(req.params.docId, (doc) =>
       addReply(doc, req.params.threadId, { ...who, text }),
     );
+    publish(res, req.params.docId, {
+      type: 'comment.reply',
+      threadId: req.params.threadId,
+      text,
+      ...who,
+    });
+    publishMentions(res, req.params.docId, text, who);
     res.json({ ok: true });
   },
 );
@@ -514,12 +556,39 @@ app.post(
     await withDoc(req.params.docId, (doc) =>
       setResolved(doc, req.params.threadId, resolved),
     );
+    publish(res, req.params.docId, {
+      type: 'comment.resolve',
+      threadId: req.params.threadId,
+    });
     res.json({ ok: true });
   },
 );
 
 app.get('/api/docs/:docId/suggestions', needs('read'), docAccess('read'), async (req, res) => {
   res.json(await withDoc(req.params.docId, (doc) => snapshotSuggestions(doc)));
+});
+
+/**
+ * Realtime event stream (SSE) for a doc — the agent-native alternative to
+ * polling. Subscribers (agents or the web) receive comments, suggestions,
+ * reviews, mentions, and edits as they happen. Requires read access; a
+ * heartbeat comment keeps proxies from closing an idle stream.
+ */
+app.get('/api/docs/:docId/events', needs('read'), docAccess('read'), (req, res) => {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+  });
+  res.write(': connected\n\n');
+  const unsubscribe = docEvents.subscribe(req.params.docId, (e) => {
+    res.write(`event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`);
+  });
+  const heartbeat = setInterval(() => res.write(': ping\n\n'), 25_000);
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    unsubscribe();
+  });
 });
 
 app.post('/api/docs/:docId/suggestions', needs('suggest'), docAccess('suggest'), async (req, res) => {
@@ -561,6 +630,7 @@ app.post('/api/docs/:docId/suggestions', needs('suggest'), docAccess('suggest'),
     res.status(400).json({ error: 'range not found (from/to or anchorText)' });
     return;
   }
+  publish(res, req.params.docId, { type: 'suggestion', suggestionId: result, ...who });
   res.status(201).json({ id: result });
 });
 
@@ -625,6 +695,10 @@ app.put(
       res.status(400).json({ error: 'range out of bounds' });
       return;
     }
+    publish(res, req.params.docId, {
+      type: 'suggestion.update',
+      suggestionId: req.params.sid,
+    });
     res.json({ ok: true });
   },
 );
@@ -672,6 +746,13 @@ app.post(
       res.status(404).json({ error: 'not found' });
       return;
     }
+    publish(res, req.params.docId, {
+      type: 'suggestion.reply',
+      suggestionId: req.params.sid,
+      text,
+      ...who,
+    });
+    publishMentions(res, req.params.docId, text, who);
     res.json({ ok: true });
   },
 );
@@ -684,6 +765,10 @@ app.post(
     const ok = await withDoc(req.params.docId, (doc) =>
       acceptSuggestion(doc, doc.getText(CONTENT_FIELD), req.params.sid),
     );
+    publish(res, req.params.docId, {
+      type: 'suggestion.accept',
+      suggestionId: req.params.sid,
+    });
     res.json({ ok });
   },
 );
@@ -696,6 +781,10 @@ app.post(
     await withDoc(req.params.docId, (doc) =>
       rejectSuggestion(doc, req.params.sid),
     );
+    publish(res, req.params.docId, {
+      type: 'suggestion.reject',
+      suggestionId: req.params.sid,
+    });
     res.json({ ok: true });
   },
 );

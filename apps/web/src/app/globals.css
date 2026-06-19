@@ -125,6 +125,11 @@ button { font-family: inherit; cursor: pointer; }
   border: none;
 }
 
+.avatar.agent {
+  border-style: dashed;
+  font-size: 13px;
+}
+
 .mode-toggle {
   display: flex;
   border: 1px solid var(--chrome-border);
