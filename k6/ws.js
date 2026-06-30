@@ -15,7 +15,7 @@
 //   (defaults target ~2x a modest expected peak; see k6/README.md)
 
 import { WebSocket } from 'k6/experimental/websockets';
-import { setTimeout } from 'k6/experimental/timers';
+// setTimeout is a k6 global (the experimental/timers module graduated).
 import http from 'k6/http';
 import { check, fail } from 'k6';
 import { Counter, Trend } from 'k6/metrics';
