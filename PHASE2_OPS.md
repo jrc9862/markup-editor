@@ -151,10 +151,35 @@ docker compose -f docker-compose.yml -f docker-compose.scale.yml \
 - **`!reset` on the server's `ports`** (needs Compose ≥ 2.24) drops the base
   file's `4000:4000` so replicas don't collide — nginx owns the public port.
 
+## Slice 4 — Load testing (shipped)
+
+k6 scenarios under `k6/` (see `k6/README.md`) covering the two scaling axes for
+a ~10k-user deployment, plus a manual CI workflow.
+
+| File | What it stresses |
+|---|---|
+| `k6/ws.js` | Concurrent live connections: WS upgrade + `onAuthenticate` (principal + ACL + per-user conn cap) + doc load + holding presence. Ramps VUs, holds, drains. |
+| `k6/rest.js` | Agent-surface read/write throughput: snapshot reads, transactional `/edits`, comments, doc list. |
+| `k6/lib/hocuspocus.js` | Minimal Hocuspocus/Yjs wire codec (`varString(doc) + varUint(type) + payload`) — just enough to authenticate + sync-step-1 + classify replies, so k6 doesn't have to bundle yjs. |
+
+WS connection *capacity* and edit *throughput* are split deliberately:
+generating valid Yjs binary updates in raw k6 is impractical, so `ws.js` opens
++ authenticates + syncs + holds (the expensive per-connection path) while
+`rest.js` drives writes through REST. Both scripts carry thresholds (no auth
+denials / WS errors, p95 connect < 1s, p95 REST < 800ms) so a regression fails
+the run. `.github/workflows/loadtest.yml` runs them manually
+(`workflow_dispatch`, inputs: scenario / vus / duration) against the workflow's
+Postgres service — intentionally off push/PR since load tests are slow.
+
+The wire codec was validated against a live server (authenticated + sync
+replies received). Aim VUs at ~2× expected peak, and run `ws.js` across
+multiple k6 processes for 10k-connection targets (one process won't sustain
+that many sockets — the scenario composes cleanly across instances).
+
 ## Remaining Phase 2 slices
 
-1. **Load testing.** k6 WebSocket + REST scripts at ~2× expected peak, wired
-   into a manual CI workflow.
+_None — Phase 2 (observability/limits, retention/backups, Redis multi-node,
+load testing) is complete._
 
 ## Backups (runbook)
 
