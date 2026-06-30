@@ -385,8 +385,10 @@ way), mono accents (CSS vars in `globals.css`).
    (gated by `REDIS_URL`): Hocuspocus Redis extension for Yjs/awareness
    fan-out, with the in-process `docEvents` SSE bus and `lastEditor`
    attribution map moved onto Redis (`apps/server/src/redis.ts`), and an LB
-   topology in `docker-compose.scale.yml` + `deploy/nginx.conf`. Remaining: k6
-   load testing (see ENTERPRISE_PLAN.md, PHASE2_OPS.md).
+   topology in `docker-compose.scale.yml` + `deploy/nginx.conf`. Plus k6 load
+   testing (`k6/` — `ws.js` connection-capacity + `rest.js` throughput, sharing
+   a minimal Hocuspocus wire codec in `k6/lib/hocuspocus.js`; manual CI in
+   `.github/workflows/loadtest.yml`). Phase 2 is complete (see PHASE2_OPS.md).
 
 Shipped from the original roadmap: togglable realtime suggestion mode
 (both source and rendered modes), in-rendered-view annotation highlights,
