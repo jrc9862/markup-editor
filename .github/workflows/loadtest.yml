@@ -1,0 +1,99 @@
+name: Load test
+
+# Manual only: load tests are slow and noisy, so they don't run on push/PR.
+# Trigger from the Actions tab before a release or after a scaling change.
+on:
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: Which k6 scenario to run
+        type: choice
+        default: both
+        options: [both, rest, ws]
+      vus:
+        description: Peak virtual users (per scenario)
+        type: string
+        default: '100'
+      duration:
+        description: Hold time at peak (e.g. 1m, 30s)
+        type: string
+        default: '1m'
+
+jobs:
+  loadtest:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: markup
+          POSTGRES_PASSWORD: markup
+          POSTGRES_DB: markup_load
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U markup"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgres://markup:markup@localhost:5432/markup_load
+      MARKUP_RATE_MAX: '0' # the app, not the rate limiter, should be the bottleneck
+      PORT: '4000'
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build sync-core
+        run: npm run build --workspace @markup/sync-core
+
+      - name: Build server
+        run: npm run build --workspace @markup/server
+
+      - name: Install k6
+        uses: grafana/setup-k6-action@v1
+
+      - name: Start server
+        run: |
+          node apps/server/dist/index.js > server.log 2>&1 &
+          echo "SERVER_PID=$!" >> "$GITHUB_ENV"
+          # Wait for readiness (MetaStore.ping ok + not shutting down).
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:4000/readyz >/dev/null 2>&1; then
+              echo "server ready"; exit 0
+            fi
+            sleep 1
+          done
+          echo "server did not become ready"; cat server.log; exit 1
+
+      - name: Run REST load test
+        if: ${{ inputs.scenario == 'both' || inputs.scenario == 'rest' }}
+        run: k6 run k6/rest.js
+        env:
+          VUS: ${{ inputs.vus }}
+          DURATION: ${{ inputs.duration }}
+
+      - name: Run WS load test
+        if: ${{ inputs.scenario == 'both' || inputs.scenario == 'ws' }}
+        run: k6 run k6/ws.js
+        env:
+          VUS: ${{ inputs.vus }}
+          DURATION: ${{ inputs.duration }}
+
+      - name: Server logs
+        if: always()
+        run: cat server.log || true
+
+      - name: Stop server
+        if: always()
+        run: kill "$SERVER_PID" 2>/dev/null || true
