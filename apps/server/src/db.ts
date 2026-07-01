@@ -7,6 +7,10 @@ import type {
   DocRole,
   TokenScope,
   VersionMeta,
+  Workspace,
+  WorkspaceMember,
+  WorkspaceRole,
+  WorkspaceWithRole,
 } from '@markup/sync-core';
 
 export interface SessionRow {
@@ -54,6 +58,7 @@ export interface MetaStore {
     name: string,
     path?: string,
     ownerId?: string,
+    workspaceId?: string,
   ): Promise<DocMeta>;
   get(docId: string): Promise<DocMeta | undefined>;
   list(): Promise<DocMeta[]>;
@@ -121,6 +126,44 @@ export interface MetaStore {
   listAcl(docId: string): Promise<AclEntry[]>;
   setLinkRole(docId: string, role: DocRole | 'none'): Promise<void>;
 
+  // --- Workspaces (Phase 3). A doc may belong to one workspace; membership
+  // grants a baseline doc role and admins act as owner (see auth.roleFor).
+  createWorkspace(
+    id: string,
+    name: string,
+    slug: string,
+    defaultRole: DocRole,
+  ): Promise<Workspace>;
+  getWorkspace(id: string): Promise<Workspace | undefined>;
+  getWorkspaceBySlug(slug: string): Promise<Workspace | undefined>;
+  /** Workspaces the user belongs to, each with the user's membership role. */
+  listWorkspacesForUser(userId: string): Promise<WorkspaceWithRole[]>;
+  updateWorkspace(
+    id: string,
+    fields: { name?: string; defaultRole?: DocRole },
+  ): Promise<Workspace | undefined>;
+  /** Delete a workspace and detach its docs (workspace_id -> NULL). */
+  deleteWorkspace(id: string): Promise<boolean>;
+  /** Add or update a membership. */
+  addMember(
+    workspaceId: string,
+    userId: string,
+    role: WorkspaceRole,
+  ): Promise<void>;
+  getMembership(
+    workspaceId: string,
+    userId: string,
+  ): Promise<WorkspaceRole | undefined>;
+  listMembers(workspaceId: string): Promise<WorkspaceMember[]>;
+  /** Count members at a given role (used to guard the last admin). */
+  countMembersWithRole(
+    workspaceId: string,
+    role: WorkspaceRole,
+  ): Promise<number>;
+  removeMember(workspaceId: string, userId: string): Promise<boolean>;
+  /** Move a doc into a workspace (or `null` to detach it). */
+  setDocWorkspace(docId: string, workspaceId: string | null): Promise<void>;
+
   /** Readiness probe: round-trips a trivial query, throws if unreachable. */
   ping(): Promise<void>;
   close(): Promise<void>;
@@ -134,6 +177,7 @@ interface MetaRow {
   updated_at: string;
   owner_id: string | null;
   link_role: string | null;
+  workspace_id: string | null;
 }
 
 function toMeta(row: MetaRow): DocMeta {
@@ -145,6 +189,25 @@ function toMeta(row: MetaRow): DocMeta {
     updatedAt: row.updated_at,
     ownerId: row.owner_id ?? undefined,
     linkRole: (row.link_role as DocMeta['linkRole']) ?? undefined,
+    workspaceId: row.workspace_id ?? undefined,
+  };
+}
+
+interface WorkspaceRow {
+  id: string;
+  name: string;
+  slug: string;
+  default_role: string;
+  created_at: string;
+}
+
+function toWorkspace(row: WorkspaceRow): Workspace {
+  return {
+    id: row.id,
+    name: row.name,
+    slug: row.slug,
+    defaultRole: row.default_role as DocRole,
+    createdAt: row.created_at,
   };
 }
 
@@ -209,6 +272,22 @@ export class SqliteMetaStore implements MetaStore {
         PRIMARY KEY (doc_id, user_id)
       );
     `);
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS workspaces (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        slug TEXT NOT NULL UNIQUE,
+        default_role TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS workspace_members (
+        workspace_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        role TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (workspace_id, user_id)
+      );
+    `);
     // Migrations: older databases lack these doc_meta columns.
     const cols = this.db.prepare('PRAGMA table_info(doc_meta)').all() as Array<{
       name: string;
@@ -217,6 +296,7 @@ export class SqliteMetaStore implements MetaStore {
       ['path', 'ALTER TABLE doc_meta ADD COLUMN path TEXT'],
       ['owner_id', 'ALTER TABLE doc_meta ADD COLUMN owner_id TEXT'],
       ['link_role', 'ALTER TABLE doc_meta ADD COLUMN link_role TEXT'],
+      ['workspace_id', 'ALTER TABLE doc_meta ADD COLUMN workspace_id TEXT'],
     ] as const) {
       if (!cols.some((c) => c.name === col)) this.db.exec(ddl);
     }
@@ -238,14 +318,23 @@ export class SqliteMetaStore implements MetaStore {
     name: string,
     path?: string,
     ownerId?: string,
+    workspaceId?: string,
   ): Promise<DocMeta> {
     const now = new Date().toISOString();
     this.db
       .prepare(
-        'INSERT INTO doc_meta (doc_id, name, path, created_at, updated_at, owner_id) VALUES (?, ?, ?, ?, ?, ?)',
+        'INSERT INTO doc_meta (doc_id, name, path, created_at, updated_at, owner_id, workspace_id) VALUES (?, ?, ?, ?, ?, ?, ?)',
       )
-      .run(docId, name, path ?? null, now, now, ownerId ?? null);
-    return { docId, name, path, createdAt: now, updatedAt: now, ownerId };
+      .run(docId, name, path ?? null, now, now, ownerId ?? null, workspaceId ?? null);
+    return {
+      docId,
+      name,
+      path,
+      createdAt: now,
+      updatedAt: now,
+      ownerId,
+      workspaceId,
+    };
   }
 
   async get(docId: string): Promise<DocMeta | undefined> {
@@ -561,6 +650,148 @@ export class SqliteMetaStore implements MetaStore {
     this.db
       .prepare('UPDATE doc_meta SET link_role = ? WHERE doc_id = ?')
       .run(role, docId);
+  }
+
+  // --- Workspaces -------------------------------------------------------------
+
+  async createWorkspace(
+    id: string,
+    name: string,
+    slug: string,
+    defaultRole: DocRole,
+  ): Promise<Workspace> {
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        'INSERT INTO workspaces (id, name, slug, default_role, created_at) VALUES (?, ?, ?, ?, ?)',
+      )
+      .run(id, name, slug, defaultRole, now);
+    return { id, name, slug, defaultRole, createdAt: now };
+  }
+
+  async getWorkspace(id: string): Promise<Workspace | undefined> {
+    const row = this.db
+      .prepare('SELECT * FROM workspaces WHERE id = ?')
+      .get(id) as WorkspaceRow | undefined;
+    return row ? toWorkspace(row) : undefined;
+  }
+
+  async getWorkspaceBySlug(slug: string): Promise<Workspace | undefined> {
+    const row = this.db
+      .prepare('SELECT * FROM workspaces WHERE slug = ?')
+      .get(slug) as WorkspaceRow | undefined;
+    return row ? toWorkspace(row) : undefined;
+  }
+
+  async listWorkspacesForUser(userId: string): Promise<WorkspaceWithRole[]> {
+    const rows = this.db
+      .prepare(
+        `SELECT w.*, m.role AS member_role
+         FROM workspace_members m JOIN workspaces w ON w.id = m.workspace_id
+         WHERE m.user_id = ? ORDER BY w.name`,
+      )
+      .all(userId) as Array<WorkspaceRow & { member_role: WorkspaceRole }>;
+    return rows.map((r) => ({ ...toWorkspace(r), role: r.member_role }));
+  }
+
+  async updateWorkspace(
+    id: string,
+    fields: { name?: string; defaultRole?: DocRole },
+  ): Promise<Workspace | undefined> {
+    const sets: string[] = [];
+    const vals: unknown[] = [];
+    if (fields.name !== undefined) {
+      sets.push('name = ?');
+      vals.push(fields.name);
+    }
+    if (fields.defaultRole !== undefined) {
+      sets.push('default_role = ?');
+      vals.push(fields.defaultRole);
+    }
+    if (sets.length) {
+      vals.push(id);
+      this.db
+        .prepare(`UPDATE workspaces SET ${sets.join(', ')} WHERE id = ?`)
+        .run(...vals);
+    }
+    return this.getWorkspace(id);
+  }
+
+  async deleteWorkspace(id: string): Promise<boolean> {
+    const tx = this.db.transaction((wid: string) => {
+      this.db
+        .prepare('UPDATE doc_meta SET workspace_id = NULL WHERE workspace_id = ?')
+        .run(wid);
+      this.db.prepare('DELETE FROM workspace_members WHERE workspace_id = ?').run(wid);
+      return this.db.prepare('DELETE FROM workspaces WHERE id = ?').run(wid);
+    });
+    return tx(id).changes > 0;
+  }
+
+  async addMember(
+    workspaceId: string,
+    userId: string,
+    role: WorkspaceRole,
+  ): Promise<void> {
+    this.db
+      .prepare(
+        `INSERT INTO workspace_members (workspace_id, user_id, role, created_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT (workspace_id, user_id) DO UPDATE SET role = excluded.role`,
+      )
+      .run(workspaceId, userId, role, new Date().toISOString());
+  }
+
+  async getMembership(
+    workspaceId: string,
+    userId: string,
+  ): Promise<WorkspaceRole | undefined> {
+    const row = this.db
+      .prepare(
+        'SELECT role FROM workspace_members WHERE workspace_id = ? AND user_id = ?',
+      )
+      .get(workspaceId, userId) as { role: WorkspaceRole } | undefined;
+    return row?.role;
+  }
+
+  async listMembers(workspaceId: string): Promise<WorkspaceMember[]> {
+    return this.db
+      .prepare(
+        `SELECT m.user_id AS userId, m.role, u.email, u.name
+         FROM workspace_members m LEFT JOIN users u ON u.id = m.user_id
+         WHERE m.workspace_id = ? ORDER BY u.email`,
+      )
+      .all(workspaceId) as WorkspaceMember[];
+  }
+
+  async countMembersWithRole(
+    workspaceId: string,
+    role: WorkspaceRole,
+  ): Promise<number> {
+    const row = this.db
+      .prepare(
+        'SELECT COUNT(*) AS n FROM workspace_members WHERE workspace_id = ? AND role = ?',
+      )
+      .get(workspaceId, role) as { n: number };
+    return row.n;
+  }
+
+  async removeMember(workspaceId: string, userId: string): Promise<boolean> {
+    const res = this.db
+      .prepare(
+        'DELETE FROM workspace_members WHERE workspace_id = ? AND user_id = ?',
+      )
+      .run(workspaceId, userId);
+    return res.changes > 0;
+  }
+
+  async setDocWorkspace(
+    docId: string,
+    workspaceId: string | null,
+  ): Promise<void> {
+    this.db
+      .prepare('UPDATE doc_meta SET workspace_id = ? WHERE doc_id = ?')
+      .run(workspaceId, docId);
   }
 
   async ping(): Promise<void> {

@@ -226,6 +226,62 @@ function metaStoreContract(makeStore: () => Promise<MetaStore>) {
     expect(await store.listVersions('doc-sweep-b')).toHaveLength(1);
   });
 
+  it('manages workspaces and membership', async () => {
+    await store.upsertUser('ws-admin', 'wsadmin@example.com', 'WS Admin');
+    await store.upsertUser('ws-member', 'wsmember@example.com', 'WS Member');
+
+    const ws = await store.createWorkspace('ws-1', 'Acme', 'acme', 'suggester');
+    expect(ws).toMatchObject({ id: 'ws-1', slug: 'acme', defaultRole: 'suggester' });
+    expect(await store.getWorkspace('ws-1')).toEqual(ws);
+    expect(await store.getWorkspaceBySlug('acme')).toEqual(ws);
+    expect(await store.getWorkspace('nope')).toBeUndefined();
+
+    await store.addMember('ws-1', 'ws-admin', 'admin');
+    await store.addMember('ws-1', 'ws-member', 'member');
+    expect(await store.getMembership('ws-1', 'ws-admin')).toBe('admin');
+    expect(await store.getMembership('ws-1', 'ws-member')).toBe('member');
+    expect(await store.getMembership('ws-1', 'stranger')).toBeUndefined();
+    expect(await store.countMembersWithRole('ws-1', 'admin')).toBe(1);
+
+    const forUser = await store.listWorkspacesForUser('ws-member');
+    expect(forUser).toEqual([{ ...ws, role: 'member' }]);
+
+    const members = await store.listMembers('ws-1');
+    expect(members).toEqual(
+      expect.arrayContaining([
+        { userId: 'ws-admin', role: 'admin', email: 'wsadmin@example.com', name: 'WS Admin' },
+        { userId: 'ws-member', role: 'member', email: 'wsmember@example.com', name: 'WS Member' },
+      ]),
+    );
+
+    // addMember upserts the role
+    await store.addMember('ws-1', 'ws-member', 'admin');
+    expect(await store.getMembership('ws-1', 'ws-member')).toBe('admin');
+    expect(await store.countMembersWithRole('ws-1', 'admin')).toBe(2);
+
+    const updated = await store.updateWorkspace('ws-1', { defaultRole: 'commenter' });
+    expect(updated?.defaultRole).toBe('commenter');
+
+    expect(await store.removeMember('ws-1', 'ws-member')).toBe(true);
+    expect(await store.removeMember('ws-1', 'ws-member')).toBe(false);
+  });
+
+  it('assigns docs to a workspace and detaches on delete', async () => {
+    await store.createWorkspace('ws-2', 'Beta', 'beta', 'editor');
+    const doc = await store.create('ws-doc', 'w.md', undefined, undefined, 'ws-2');
+    expect(doc.workspaceId).toBe('ws-2');
+    expect((await store.get('ws-doc'))?.workspaceId).toBe('ws-2');
+
+    await store.setDocWorkspace('ws-doc', null);
+    expect((await store.get('ws-doc'))?.workspaceId).toBeUndefined();
+
+    await store.setDocWorkspace('ws-doc', 'ws-2');
+    // deleting the workspace detaches its docs rather than orphaning them
+    expect(await store.deleteWorkspace('ws-2')).toBe(true);
+    expect(await store.getWorkspace('ws-2')).toBeUndefined();
+    expect((await store.get('ws-doc'))?.workspaceId).toBeUndefined();
+  });
+
   it('ping resolves while the store is reachable', async () => {
     await expect(store.ping()).resolves.toBeUndefined();
   });
@@ -243,7 +299,7 @@ describe.skipIf(!DATABASE_URL)('PostgresMetaStore', () => {
   beforeAll(async () => {
     // Tests own the schema: start clean so the contract's fixed ids work.
     await pool.query(
-      'DROP TABLE IF EXISTS doc_meta, doc_versions, documents, schema_migrations',
+      'DROP TABLE IF EXISTS doc_meta, doc_versions, documents, users, sessions, api_tokens, doc_acl, workspaces, workspace_members, schema_migrations CASCADE',
     );
   });
 
