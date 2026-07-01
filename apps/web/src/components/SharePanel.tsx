@@ -1,8 +1,14 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import type { AclEntry, AuthUser, DocRole } from '@markup/sync-core';
+import type {
+  AclEntry,
+  AuthUser,
+  DocRole,
+  WorkspaceWithRole,
+} from '@markup/sync-core';
 import { SERVER_HTTP, authHeaders } from '@/lib/config';
+import { listWorkspaces } from '@/lib/workspaces';
 
 const GRANTABLE: DocRole[] = ['editor', 'suggester', 'commenter', 'viewer'];
 
@@ -31,6 +37,8 @@ export default function SharePanel({
   const [role, setRole] = useState<DocRole>('editor');
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [workspaces, setWorkspaces] = useState<WorkspaceWithRole[]>([]);
+  const [workspaceId, setWorkspaceId] = useState<string>('');
   const ref = useRef<HTMLDivElement>(null);
 
   const api = (path: string, init?: RequestInit) =>
@@ -52,9 +60,30 @@ export default function SharePanel({
   };
 
   useEffect(() => {
-    if (open && isOwner) refresh();
+    if (!open || !isOwner) return;
+    refresh();
+    // The doc's current workspace + the ones the owner could move it into.
+    listWorkspaces().then(setWorkspaces).catch(() => {});
+    api('')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => setWorkspaceId((d as { workspaceId?: string })?.workspaceId ?? ''))
+      .catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, isOwner, docId]);
+
+  const moveToWorkspace = async (next: string) => {
+    setError(null);
+    const r = await api('', {
+      method: 'PATCH',
+      body: JSON.stringify({ workspaceId: next === '' ? null : next }),
+    });
+    if (!r.ok) {
+      const body = (await r.json().catch(() => null)) as { error?: string } | null;
+      setError(body?.error ?? `failed (${r.status})`);
+      return;
+    }
+    setWorkspaceId(next);
+  };
 
   useEffect(() => {
     if (!open) return;
@@ -118,6 +147,22 @@ export default function SharePanel({
                     </option>
                   ))}
                   <option value="none">no access</option>
+                </select>
+              </label>
+
+              <label className="share-row">
+                <span>Workspace</span>
+                <select
+                  className="tb-select"
+                  value={workspaceId}
+                  onChange={(e) => void moveToWorkspace(e.target.value)}
+                >
+                  <option value="">none (personal)</option>
+                  {workspaces.map((w) => (
+                    <option key={w.id} value={w.id}>
+                      {w.name}
+                    </option>
+                  ))}
                 </select>
               </label>
 
