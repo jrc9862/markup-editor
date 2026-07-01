@@ -2,6 +2,7 @@ import pg from 'pg';
 import type {
   AclEntry,
   ApiTokenMeta,
+  AuditEntry,
   AuthUser,
   DocMeta,
   DocRole,
@@ -99,6 +100,20 @@ const MIGRATIONS: string[] = [
      PRIMARY KEY (workspace_id, user_id)
    )`,
   `ALTER TABLE doc_meta ADD COLUMN workspace_id TEXT`,
+  // Phase 3: audit log — workspace-administrative actions, scoped to a
+  // workspace and cascade-deleted with it (see db.ts appendAudit/listAudit).
+  `CREATE TABLE audit_log (
+     id BIGSERIAL PRIMARY KEY,
+     workspace_id TEXT NOT NULL,
+     ts TEXT NOT NULL,
+     actor_id TEXT,
+     actor_name TEXT,
+     action TEXT NOT NULL,
+     target_type TEXT NOT NULL,
+     target_id TEXT,
+     detail TEXT
+   )`,
+  `CREATE INDEX idx_audit_ws ON audit_log (workspace_id, id)`,
 ];
 
 const MIGRATION_LOCK_KEY = 0x6d61726b; // arbitrary app-wide advisory lock id
@@ -199,6 +214,34 @@ function toWorkspace(row: WorkspaceRow): Workspace {
     slug: row.slug,
     defaultRole: row.default_role as DocRole,
     createdAt: row.created_at,
+  };
+}
+
+interface AuditRow {
+  id: string | number;
+  workspace_id: string;
+  ts: string;
+  actor_id: string | null;
+  actor_name: string | null;
+  action: string;
+  target_type: string;
+  target_id: string | null;
+  detail: string | null;
+}
+
+function toAudit(row: AuditRow): AuditEntry {
+  return {
+    // BIGSERIAL arrives as a string from node-postgres; ids stay well under
+    // 2^53 in practice, so Number() is safe for the cursor.
+    id: Number(row.id),
+    workspaceId: row.workspace_id,
+    ts: row.ts,
+    actorId: row.actor_id ?? undefined,
+    actorName: row.actor_name ?? undefined,
+    action: row.action as AuditEntry['action'],
+    targetType: row.target_type as AuditEntry['targetType'],
+    targetId: row.target_id ?? undefined,
+    detail: row.detail ? (JSON.parse(row.detail) as Record<string, unknown>) : undefined,
   };
 }
 
@@ -641,6 +684,7 @@ export class PostgresMetaStore implements MetaStore {
       await client.query('DELETE FROM workspace_members WHERE workspace_id = $1', [
         id,
       ]);
+      await client.query('DELETE FROM audit_log WHERE workspace_id = $1', [id]);
       const res = await client.query('DELETE FROM workspaces WHERE id = $1', [id]);
       await client.query('COMMIT');
       return (res.rowCount ?? 0) > 0;
@@ -723,6 +767,45 @@ export class PostgresMetaStore implements MetaStore {
       'UPDATE doc_meta SET workspace_id = $1 WHERE doc_id = $2',
       [workspaceId, docId],
     );
+  }
+
+  async appendAudit(entry: Omit<AuditEntry, 'id'>): Promise<AuditEntry> {
+    const res = await this.pool.query(
+      `INSERT INTO audit_log
+         (workspace_id, ts, actor_id, actor_name, action, target_type, target_id, detail)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+      [
+        entry.workspaceId,
+        entry.ts,
+        entry.actorId ?? null,
+        entry.actorName ?? null,
+        entry.action,
+        entry.targetType,
+        entry.targetId ?? null,
+        entry.detail ? JSON.stringify(entry.detail) : null,
+      ],
+    );
+    return { ...entry, id: Number(res.rows[0].id) };
+  }
+
+  async listAudit(
+    workspaceId: string,
+    opts?: { limit?: number; before?: number },
+  ): Promise<AuditEntry[]> {
+    const limit = Math.min(Math.max(opts?.limit ?? 100, 1), 1000);
+    const res =
+      opts?.before !== undefined
+        ? await this.pool.query(
+            `SELECT * FROM audit_log WHERE workspace_id = $1 AND id < $2
+             ORDER BY id DESC LIMIT $3`,
+            [workspaceId, opts.before, limit],
+          )
+        : await this.pool.query(
+            `SELECT * FROM audit_log WHERE workspace_id = $1
+             ORDER BY id DESC LIMIT $2`,
+            [workspaceId, limit],
+          );
+    return (res.rows as AuditRow[]).map(toAudit);
   }
 
   async ping(): Promise<void> {

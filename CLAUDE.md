@@ -116,6 +116,9 @@ reach every connected human (and the CLI daemon → disk) in realtime:
   (Phase 3); create makes you admin, admin manages members/`defaultRole`.
   `PATCH /api/docs/:id {workspaceId}` moves a doc into/out of a workspace
   (owner only, into a workspace you belong to)
+- `GET /api/workspaces/:id/audit` — per-workspace audit log (admin only):
+  administrative actions newest-first, keyset-paginated (`?limit`/`?before`),
+  `?format=csv` for a downloadable export (see PHASE3_AUDIT.md)
 - `GET /api/git/status` · `GET /api/git/branches` · `POST /api/git/commit`
   `{message,paths?}` · `POST /api/git/branch` `{name,checkout?}` ·
   `POST /api/git/checkout` `{name}` — only when `MARKUP_REPO_DIR` is set (404
@@ -193,7 +196,12 @@ maps user→`admin`/`member`. The whole access impact is centralized in
 `default_role` baseline, and an owner's explicit ACL grant can promote a member
 above it (`strongerRole`). Managed via the `/api/workspaces` routes (create →
 admin; admin manages members and `defaultRole`; last-admin protected); deleting
-a workspace detaches its docs rather than orphaning them. Signed-in humans are
+a workspace detaches its docs rather than orphaning them. A per-workspace
+**audit log** (Phase 3, see PHASE3_AUDIT.md; `audit_log` table on both backends,
+`MetaStore.appendAudit`/`listAudit`) records administrative actions
+(workspace/member changes, doc attach/detach) via a best-effort `audit()`
+side-call in those routes; admins read/export it at `GET .../audit`
+(`?format=csv`), and it cascade-deletes with its workspace. Signed-in humans are
 stamped with real name + `authorId` on
 comments/suggestions; self-reported names are ignored. Web uses
 `NEXT_PUBLIC_MARKUP_TOKEN` as fallback plus the session cookie
@@ -392,7 +400,8 @@ way), mono accents (CSS vars in `globals.css`).
    Workspace membership shipped as Phase 3 slice 1 (server + REST; see
    PHASE3_WORKSPACES.md), with the workspace web UI as slice 2 (home-page
    Workspaces section + member management + move-doc-into-workspace in the
-   Share popover). Remaining: SAML/SCIM.
+   Share popover) and a per-workspace audit log as slice 3 (server + REST;
+   see PHASE3_AUDIT.md). Remaining: SAML/SCIM.
 2. **Enterprise Phase 2 (scale/ops)** — observability + self-protection
    limits shipped (structured logs, `/metrics`, `/readyz`, REST rate limiting,
    per-user WS caps, doc byte-size guard); plus history retention + backups
