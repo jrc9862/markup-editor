@@ -145,6 +145,10 @@ by an enterprise today.
      in `auth.roleFor` (workspace admins act as owner over the workspace's
      docs; members get the workspace's `default_role` baseline, promotable by
      an owner's ACL grant). `/api/workspaces` route family + a `workspaceId`
-     branch on `PATCH /api/docs/:id`. Server + REST + tests; the workspace web
-     UI rides with the admin-console slice.
-   - Remaining: workspace web UI, SAML/SCIM, audit log export, admin console.
+     branch on `PATCH /api/docs/:id`. Server + REST + tests.
+   - **Slice 2 — workspace web UI (shipped).** Home-page Workspaces section
+     (list/create, admin-gated member management + `defaultRole`, delete) and
+     a Workspace selector in the owner's Share popover to move a doc into/out
+     of a workspace (`lib/workspaces.ts`, `WorkspacesPanel.tsx`, `SharePanel`).
+     Web only — drives the slice-1 routes unchanged.
+   - Remaining: SAML/SCIM, audit log export, admin console.

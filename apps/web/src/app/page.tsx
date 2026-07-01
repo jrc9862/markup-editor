@@ -4,7 +4,9 @@ import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import type { DocMeta } from '@markup/sync-core';
 import { SERVER_HTTP, authHeaders } from '@/lib/config';
+import { useMe } from '@/lib/auth';
 import UserMenu from '@/components/UserMenu';
+import WorkspacesPanel from '@/components/WorkspacesPanel';
 
 interface TreeDir {
   dirs: Map<string, TreeDir>;
@@ -91,6 +93,7 @@ function TreeBody({ node, onRename }: { node: TreeDir; onRename: RenameFn }) {
 export default function HomePage() {
   const [docs, setDocs] = useState<DocMeta[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const { me } = useMe();
 
   useEffect(() => {
     fetch(`${SERVER_HTTP}/api/docs`, {
@@ -139,6 +142,7 @@ export default function HomePage() {
         Files appear here in the same directory structure as on disk. Open one
         from your terminal with <code>markup open path/to/file.md</code>.
       </p>
+      {me?.kind === 'user' && <WorkspacesPanel />}
       {error && <p style={{ color: 'var(--red)' }}>Could not load docs: {error}</p>}
       {docs && docs.length === 0 && <p className="empty">No documents yet.</p>}
       {docs && docs.length > 0 && (

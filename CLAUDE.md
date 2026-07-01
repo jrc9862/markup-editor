@@ -390,7 +390,9 @@ way), mono accents (CSS vars in `globals.css`).
    PHASE1_IDENTITY.md), plus the role-aware web UI (Share popover, role
    badge, read-only editor below editor role with REST-backed annotations).
    Workspace membership shipped as Phase 3 slice 1 (server + REST; see
-   PHASE3_WORKSPACES.md). Remaining: workspace web UI, SAML/SCIM.
+   PHASE3_WORKSPACES.md), with the workspace web UI as slice 2 (home-page
+   Workspaces section + member management + move-doc-into-workspace in the
+   Share popover). Remaining: SAML/SCIM.
 2. **Enterprise Phase 2 (scale/ops)** — observability + self-protection
    limits shipped (structured logs, `/metrics`, `/readyz`, REST rate limiting,
    per-user WS caps, doc byte-size guard); plus history retention + backups
