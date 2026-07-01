@@ -1,7 +1,8 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import type {
+  AuditEntry,
   DocRole,
   WorkspaceMember,
   WorkspaceRole,
@@ -11,6 +12,8 @@ import {
   addMember,
   createWorkspace,
   deleteWorkspace,
+  fetchAuditCsv,
+  listAudit,
   listMembers,
   listWorkspaces,
   removeMember,
@@ -19,6 +22,124 @@ import {
 } from '@/lib/workspaces';
 
 const BASELINE_ROLES: DocRole[] = ['editor', 'suggester', 'commenter', 'viewer'];
+
+const AUDIT_PAGE = 50;
+
+/** One-line human summary of an audit entry from its action + detail. */
+function describeAudit(e: AuditEntry): string {
+  const d = e.detail ?? {};
+  switch (e.action) {
+    case 'workspace.create':
+      return `created workspace “${String(d.name ?? '')}” (members get ${String(d.defaultRole ?? '')})`;
+    case 'workspace.update':
+      return `updated workspace: ${Object.entries(d)
+        .map(([k, v]) => `${k}=${String(v)}`)
+        .join(', ')}`;
+    case 'member.add':
+      return `added ${String(d.email ?? e.targetId ?? '')} as ${String(d.role ?? 'member')}`;
+    case 'member.update':
+      return `changed member role ${String(d.from ?? '')} → ${String(d.to ?? '')}`;
+    case 'member.remove':
+      return `removed member (was ${String(d.role ?? '')})`;
+    case 'doc.attach':
+      return `attached doc “${String(d.name ?? e.targetId ?? '')}”`;
+    case 'doc.detach':
+      return `detached doc “${String(d.name ?? e.targetId ?? '')}”`;
+    default:
+      return e.action;
+  }
+}
+
+/**
+ * Admin-only audit log for one workspace: newest-first, keyset "load more"
+ * pagination, and a CSV export. Renders the already-built /audit REST route.
+ */
+function AuditLog({ ws }: { ws: WorkspaceWithRole }) {
+  const [entries, setEntries] = useState<AuditEntry[] | null>(null);
+  const [done, setDone] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(
+    async (before?: number) => {
+      setBusy(true);
+      setError(null);
+      try {
+        const page = await listAudit(ws.id, { limit: AUDIT_PAGE, before });
+        setEntries((prev) => (before ? [...(prev ?? []), ...page] : page));
+        if (page.length < AUDIT_PAGE) setDone(true);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        setBusy(false);
+      }
+    },
+    [ws.id],
+  );
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const exportCsv = async () => {
+    setError(null);
+    try {
+      const blob = await fetchAuditCsv(ws.id);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `audit-${ws.id}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  return (
+    <div className="audit-log">
+      <div className="audit-head">
+        <span className="audit-title">Audit log</span>
+        <button
+          className="ghost-btn"
+          disabled={!entries || entries.length === 0}
+          onClick={() => void exportCsv()}
+        >
+          Export CSV
+        </button>
+      </div>
+      {entries && entries.length > 0 ? (
+        <>
+          <table className="audit-table">
+            <tbody>
+              {entries.map((e) => (
+                <tr key={e.id}>
+                  <td className="audit-ts" title={e.ts}>
+                    {new Date(e.ts).toLocaleString()}
+                  </td>
+                  <td className="audit-actor">{e.actorName ?? e.actorId ?? '—'}</td>
+                  <td className="audit-what">{describeAudit(e)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {!done && (
+            <button
+              className="ghost-btn"
+              disabled={busy}
+              onClick={() => void load(entries[entries.length - 1].id)}
+            >
+              {busy ? 'Loading…' : 'Load more'}
+            </button>
+          )}
+        </>
+      ) : (
+        <p className="empty">{entries ? 'No activity yet.' : 'Loading…'}</p>
+      )}
+      {error && <div className="share-error">{error}</div>}
+    </div>
+  );
+}
 
 /** Member management for one workspace; only mounted when the panel expands. */
 function MemberList({ ws }: { ws: WorkspaceWithRole }) {
@@ -127,6 +248,7 @@ function WorkspaceCard({
 }) {
   const [expanded, setExpanded] = useState(false);
   const [renaming, setRenaming] = useState(false);
+  const [showAudit, setShowAudit] = useState(false);
   const isAdmin = ws.role === 'admin';
 
   const rename = async (name: string) => {
@@ -200,11 +322,16 @@ function WorkspaceCard({
               <button className="ghost-btn" onClick={() => setRenaming(true)}>
                 Rename
               </button>
+              <button className="ghost-btn" onClick={() => setShowAudit((v) => !v)}>
+                {showAudit ? 'Hide audit log' : 'Audit log'}
+              </button>
               <button className="ghost-btn ws-danger" onClick={() => void remove()}>
                 Delete
               </button>
             </div>
           )}
+
+          {isAdmin && showAudit && <AuditLog ws={ws} />}
         </div>
       )}
     </div>

@@ -401,7 +401,10 @@ way), mono accents (CSS vars in `globals.css`).
    PHASE3_WORKSPACES.md), with the workspace web UI as slice 2 (home-page
    Workspaces section + member management + move-doc-into-workspace in the
    Share popover) and a per-workspace audit log as slice 3 (server + REST;
-   see PHASE3_AUDIT.md). Remaining: SAML/SCIM.
+   see PHASE3_AUDIT.md). Slice 4 surfaced the audit log in the web UI: an
+   admin-only "Audit log" viewer inside each `WorkspacesPanel` card (paginated
+   "Load more" + CSV export via `lib/workspaces.ts` `listAudit`/`fetchAuditCsv`).
+   Remaining: SAML/SCIM.
 2. **Enterprise Phase 2 (scale/ops)** — observability + self-protection
    limits shipped (structured logs, `/metrics`, `/readyz`, REST rate limiting,
    per-user WS caps, doc byte-size guard); plus history retention + backups
