@@ -1235,6 +1235,55 @@ button { font-family: inherit; cursor: pointer; }
   max-width: 480px;
 }
 
+.audit-log {
+  margin-top: 12px;
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+}
+
+.audit-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+
+.audit-title {
+  font-family: var(--mono);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.audit-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.audit-table td {
+  padding: 4px 8px 4px 0;
+  vertical-align: top;
+  border-bottom: 1px solid var(--border);
+}
+
+.audit-ts {
+  white-space: nowrap;
+  color: var(--muted);
+  font-family: var(--mono);
+}
+
+.audit-actor {
+  white-space: nowrap;
+  color: var(--fg);
+}
+
+.audit-what {
+  color: var(--fg);
+  width: 100%;
+}
+
 /* --- presence v2: source-mode cursors we render ourselves -------------------- */
 
 .cm-remote-caret {

@@ -1,6 +1,7 @@
 'use client';
 
 import type {
+  AuditEntry,
   DocRole,
   Workspace,
   WorkspaceMember,
@@ -70,3 +71,28 @@ export const setMemberRole = (
 
 export const removeMember = (wsId: string, userId: string): Promise<{ ok: true }> =>
   ws(`/${wsId}/members/${userId}`, { method: 'DELETE' });
+
+/**
+ * Admin-only audit log for a workspace, newest-first. `before` is the id of the
+ * oldest entry already loaded — pass it to page backwards (keyset pagination).
+ */
+export const listAudit = (
+  wsId: string,
+  opts?: { limit?: number; before?: number },
+): Promise<AuditEntry[]> => {
+  const q = new URLSearchParams();
+  if (opts?.limit) q.set('limit', String(opts.limit));
+  if (opts?.before) q.set('before', String(opts.before));
+  const qs = q.toString();
+  return ws(`/${wsId}/audit${qs ? `?${qs}` : ''}`);
+};
+
+/** Fetch the full audit log as a CSV blob (server streams RFC-4180 output). */
+export const fetchAuditCsv = async (wsId: string): Promise<Blob> => {
+  const r = await fetch(`${SERVER_HTTP}/api/workspaces/${wsId}/audit?format=csv`, {
+    headers: { ...authHeaders() },
+    credentials: 'include',
+  });
+  if (!r.ok) throw new Error(`export failed (${r.status})`);
+  return r.blob();
+};
