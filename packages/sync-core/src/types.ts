@@ -76,6 +76,12 @@ export interface AuthUser {
   email: string;
   name: string;
   createdAt: string;
+  /**
+   * Whether the account is active. `false` means SCIM-deprovisioned — the user
+   * is locked out of both REST and WS (`resolvePrincipal` rejects them).
+   * Absent is treated as active, so pre-SCIM rows and tests are unaffected.
+   */
+  active?: boolean;
 }
 
 /** Metadata for a per-user/per-agent API token (plaintext shown only once). */
