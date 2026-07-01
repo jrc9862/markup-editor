@@ -53,6 +53,7 @@ import {
   type Principal,
 } from './auth.js';
 import { registerAuthRoutes, registerTokenRoutes } from './auth-routes.js';
+import { registerScimRoutes } from './scim.js';
 import { oidcFromEnv } from './oidc.js';
 import { docEvents, extractMentions, type DocEvent } from './events.js';
 import { redisFromEnv, localEditorStore } from './redis.js';
@@ -94,6 +95,9 @@ const MAX_CONN_PER_USER = Number(
 const RATE_WINDOW_MS = Number(process.env.MARKUP_RATE_WINDOW_MS ?? 60_000);
 const RATE_MAX = Number(process.env.MARKUP_RATE_MAX ?? 600);
 const METRICS_TOKEN = process.env.MARKUP_METRICS_TOKEN;
+// SCIM 2.0 provisioning. When set, an IdP authenticates to /scim/v2 with this
+// static bearer to provision/deprovision users + groups; unset ⇒ routes 404.
+const SCIM_TOKEN = process.env.MARKUP_SCIM_TOKEN;
 // Edit-history retention (Phase 2). doc_versions is the one unbounded growth
 // vector; cap it per doc. Named versions and the latest snapshot always
 // survive. 0 disables either cap.
@@ -340,6 +344,17 @@ registerAuthRoutes(app, meta, {
   webOrigin: WEB_ORIGIN,
   secureCookies: SERVER_ORIGIN.startsWith('https'),
 });
+
+// SCIM 2.0 provisioning: mounted only when configured, with its own static
+// bearer auth (the IdP has no session/user) and IP-keyed rate limiting.
+if (SCIM_TOKEN) {
+  app.use('/scim', apiLimiter);
+  registerScimRoutes(app, meta, {
+    token: SCIM_TOKEN,
+    serverOrigin: SERVER_ORIGIN,
+    logger,
+  });
+}
 
 /** Auth guard for all /api routes: resolves the acting principal. */
 app.use('/api', async (req, res, next) => {

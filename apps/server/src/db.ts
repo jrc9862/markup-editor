@@ -107,6 +107,16 @@ export interface MetaStore {
   upsertUser(id: string, email: string, name: string): Promise<AuthUser>;
   getUser(id: string): Promise<AuthUser | undefined>;
   getUserByEmail(email: string): Promise<AuthUser | undefined>;
+  // --- SCIM provisioning (Phase 3). An IdP creates/updates/deprovisions these.
+  /** All users, or those matching a SCIM `userName eq` filter (email). */
+  listUsers(opts?: { filter?: { userName?: string } }): Promise<AuthUser[]>;
+  getUserByExternalId(externalId: string): Promise<AuthUser | undefined>;
+  updateUser(
+    id: string,
+    fields: { name?: string; active?: boolean; externalId?: string },
+  ): Promise<AuthUser | undefined>;
+  /** Drop every session for a user (immediate deprovisioning effect). */
+  deleteUserSessions(userId: string): Promise<void>;
   createSession(
     tokenHash: string,
     userId: string,
@@ -134,9 +144,12 @@ export interface MetaStore {
     name: string,
     slug: string,
     defaultRole: DocRole,
+    externalId?: string,
   ): Promise<Workspace>;
   getWorkspace(id: string): Promise<Workspace | undefined>;
   getWorkspaceBySlug(slug: string): Promise<Workspace | undefined>;
+  /** Look up a workspace by its linked SCIM Group id. */
+  getWorkspaceByExternalId(externalId: string): Promise<Workspace | undefined>;
   /** Workspaces the user belongs to, each with the user's membership role. */
   listWorkspacesForUser(userId: string): Promise<WorkspaceWithRole[]>;
   updateWorkspace(
@@ -226,6 +239,26 @@ function toWorkspace(row: WorkspaceRow): Workspace {
   };
 }
 
+interface UserRow {
+  id: string;
+  email: string;
+  name: string;
+  created_at: string;
+  active?: number;
+  external_id?: string | null;
+}
+
+function toUser(row: UserRow): AuthUser {
+  return {
+    id: row.id,
+    email: row.email,
+    name: row.name,
+    createdAt: row.created_at,
+    // Migrated rows always carry `active`; treat a missing value as active.
+    active: row.active === undefined ? true : row.active !== 0,
+  };
+}
+
 interface AuditRow {
   id: number;
   workspace_id: string;
@@ -287,7 +320,9 @@ export class SqliteMetaStore implements MetaStore {
         id TEXT PRIMARY KEY,
         email TEXT NOT NULL UNIQUE,
         name TEXT NOT NULL,
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        active INTEGER NOT NULL DEFAULT 1,
+        external_id TEXT
       );
       CREATE TABLE IF NOT EXISTS sessions (
         token_hash TEXT PRIMARY KEY,
@@ -319,7 +354,8 @@ export class SqliteMetaStore implements MetaStore {
         name TEXT NOT NULL,
         slug TEXT NOT NULL UNIQUE,
         default_role TEXT NOT NULL,
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        external_id TEXT
       );
       CREATE TABLE IF NOT EXISTS workspace_members (
         workspace_id TEXT NOT NULL,
@@ -363,6 +399,23 @@ export class SqliteMetaStore implements MetaStore {
       ['author_id', 'ALTER TABLE doc_versions ADD COLUMN author_id TEXT'],
     ] as const) {
       if (!vcols.some((c) => c.name === col)) this.db.exec(ddl);
+    }
+    // Older users tables lack the SCIM provisioning columns (Phase 3).
+    const ucols = this.db
+      .prepare('PRAGMA table_info(users)')
+      .all() as Array<{ name: string }>;
+    for (const [col, ddl] of [
+      ['active', 'ALTER TABLE users ADD COLUMN active INTEGER NOT NULL DEFAULT 1'],
+      ['external_id', 'ALTER TABLE users ADD COLUMN external_id TEXT'],
+    ] as const) {
+      if (!ucols.some((c) => c.name === col)) this.db.exec(ddl);
+    }
+    // Older workspaces tables lack the SCIM Group linkage column (Phase 3).
+    const wcols = this.db
+      .prepare('PRAGMA table_info(workspaces)')
+      .all() as Array<{ name: string }>;
+    if (!wcols.some((c) => c.name === 'external_id')) {
+      this.db.exec('ALTER TABLE workspaces ADD COLUMN external_id TEXT');
     }
   }
 
@@ -547,21 +600,14 @@ export class SqliteMetaStore implements MetaStore {
   async upsertUser(id: string, email: string, name: string): Promise<AuthUser> {
     const existing = this.db
       .prepare('SELECT * FROM users WHERE email = ?')
-      .get(email) as
-      | { id: string; email: string; name: string; created_at: string }
-      | undefined;
+      .get(email) as UserRow | undefined;
     if (existing) {
       if (existing.name !== name) {
         this.db
           .prepare('UPDATE users SET name = ? WHERE id = ?')
           .run(name, existing.id);
       }
-      return {
-        id: existing.id,
-        email: existing.email,
-        name,
-        createdAt: existing.created_at,
-      };
+      return toUser({ ...existing, name });
     }
     const now = new Date().toISOString();
     this.db
@@ -569,16 +615,14 @@ export class SqliteMetaStore implements MetaStore {
         'INSERT INTO users (id, email, name, created_at) VALUES (?, ?, ?, ?)',
       )
       .run(id, email, name, now);
-    return { id, email, name, createdAt: now };
+    return { id, email, name, createdAt: now, active: true };
   }
 
   async getUser(id: string): Promise<AuthUser | undefined> {
     const row = this.db.prepare('SELECT * FROM users WHERE id = ?').get(id) as
-      | { id: string; email: string; name: string; created_at: string }
+      | UserRow
       | undefined;
-    return row
-      ? { id: row.id, email: row.email, name: row.name, createdAt: row.created_at }
-      : undefined;
+    return row ? toUser(row) : undefined;
   }
 
   async createSession(
@@ -656,12 +700,59 @@ export class SqliteMetaStore implements MetaStore {
   async getUserByEmail(email: string): Promise<AuthUser | undefined> {
     const row = this.db
       .prepare('SELECT * FROM users WHERE email = ?')
-      .get(email) as
-      | { id: string; email: string; name: string; created_at: string }
-      | undefined;
-    return row
-      ? { id: row.id, email: row.email, name: row.name, createdAt: row.created_at }
-      : undefined;
+      .get(email) as UserRow | undefined;
+    return row ? toUser(row) : undefined;
+  }
+
+  // --- SCIM provisioning (Phase 3) -------------------------------------------
+
+  async listUsers(opts?: {
+    filter?: { userName?: string };
+  }): Promise<AuthUser[]> {
+    const rows = (
+      opts?.filter?.userName !== undefined
+        ? this.db
+            .prepare('SELECT * FROM users WHERE email = ? ORDER BY created_at')
+            .all(opts.filter.userName)
+        : this.db.prepare('SELECT * FROM users ORDER BY created_at').all()
+    ) as UserRow[];
+    return rows.map(toUser);
+  }
+
+  async getUserByExternalId(externalId: string): Promise<AuthUser | undefined> {
+    const row = this.db
+      .prepare('SELECT * FROM users WHERE external_id = ?')
+      .get(externalId) as UserRow | undefined;
+    return row ? toUser(row) : undefined;
+  }
+
+  async updateUser(
+    id: string,
+    fields: { name?: string; active?: boolean; externalId?: string },
+  ): Promise<AuthUser | undefined> {
+    const sets: string[] = [];
+    const vals: unknown[] = [];
+    if (fields.name !== undefined) {
+      sets.push('name = ?');
+      vals.push(fields.name);
+    }
+    if (fields.active !== undefined) {
+      sets.push('active = ?');
+      vals.push(fields.active ? 1 : 0);
+    }
+    if (fields.externalId !== undefined) {
+      sets.push('external_id = ?');
+      vals.push(fields.externalId);
+    }
+    if (sets.length) {
+      vals.push(id);
+      this.db.prepare(`UPDATE users SET ${sets.join(', ')} WHERE id = ?`).run(...vals);
+    }
+    return this.getUser(id);
+  }
+
+  async deleteUserSessions(userId: string): Promise<void> {
+    this.db.prepare('DELETE FROM sessions WHERE user_id = ?').run(userId);
   }
 
   // --- Per-doc roles ----------------------------------------------------------
@@ -712,13 +803,14 @@ export class SqliteMetaStore implements MetaStore {
     name: string,
     slug: string,
     defaultRole: DocRole,
+    externalId?: string,
   ): Promise<Workspace> {
     const now = new Date().toISOString();
     this.db
       .prepare(
-        'INSERT INTO workspaces (id, name, slug, default_role, created_at) VALUES (?, ?, ?, ?, ?)',
+        'INSERT INTO workspaces (id, name, slug, default_role, created_at, external_id) VALUES (?, ?, ?, ?, ?, ?)',
       )
-      .run(id, name, slug, defaultRole, now);
+      .run(id, name, slug, defaultRole, now, externalId ?? null);
     return { id, name, slug, defaultRole, createdAt: now };
   }
 
@@ -726,6 +818,15 @@ export class SqliteMetaStore implements MetaStore {
     const row = this.db
       .prepare('SELECT * FROM workspaces WHERE id = ?')
       .get(id) as WorkspaceRow | undefined;
+    return row ? toWorkspace(row) : undefined;
+  }
+
+  async getWorkspaceByExternalId(
+    externalId: string,
+  ): Promise<Workspace | undefined> {
+    const row = this.db
+      .prepare('SELECT * FROM workspaces WHERE external_id = ?')
+      .get(externalId) as WorkspaceRow | undefined;
     return row ? toWorkspace(row) : undefined;
   }
 
