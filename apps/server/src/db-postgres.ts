@@ -114,6 +114,12 @@ const MIGRATIONS: string[] = [
      detail TEXT
    )`,
   `CREATE INDEX idx_audit_ws ON audit_log (workspace_id, id)`,
+  // Phase 3: SCIM provisioning — an IdP creates/updates/deprovisions accounts.
+  // `active=false` locks a user out of REST + WS (auth.resolvePrincipal);
+  // `external_id` links a resource to its IdP-side id.
+  `ALTER TABLE users ADD COLUMN active INTEGER NOT NULL DEFAULT 1`,
+  `ALTER TABLE users ADD COLUMN external_id TEXT`,
+  `ALTER TABLE workspaces ADD COLUMN external_id TEXT`,
 ];
 
 const MIGRATION_LOCK_KEY = 0x6d61726b; // arbitrary app-wide advisory lock id
@@ -146,6 +152,25 @@ export async function runMigrations(pool: pg.Pool): Promise<void> {
   } finally {
     client.release();
   }
+}
+
+interface PgUserRow {
+  id: string;
+  email: string;
+  name: string;
+  created_at: string;
+  active?: number;
+  external_id?: string | null;
+}
+
+function pgUser(r: PgUserRow): AuthUser {
+  return {
+    id: r.id,
+    email: r.email,
+    name: r.name,
+    createdAt: r.created_at,
+    active: r.active === undefined ? true : r.active !== 0,
+  };
 }
 
 // --- Yjs persistence (Hocuspocus Database extension callbacks) --------------
@@ -429,32 +454,21 @@ export class PostgresMetaStore implements MetaStore {
   // --- Identity -------------------------------------------------------------
 
   async upsertUser(id: string, email: string, name: string): Promise<AuthUser> {
-    const { rows } = await this.pool.query<{
-      id: string;
-      email: string;
-      name: string;
-      created_at: string;
-    }>(
+    const { rows } = await this.pool.query<PgUserRow>(
       `INSERT INTO users (id, email, name, created_at) VALUES ($1, $2, $3, $4)
        ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name
-       RETURNING id, email, name, created_at`,
+       RETURNING id, email, name, created_at, active, external_id`,
       [id, email, name, new Date().toISOString()],
     );
-    const r = rows[0];
-    return { id: r.id, email: r.email, name: r.name, createdAt: r.created_at };
+    return pgUser(rows[0]);
   }
 
   async getUser(id: string): Promise<AuthUser | undefined> {
-    const { rows } = await this.pool.query<{
-      id: string;
-      email: string;
-      name: string;
-      created_at: string;
-    }>('SELECT id, email, name, created_at FROM users WHERE id = $1', [id]);
-    const r = rows[0];
-    return r
-      ? { id: r.id, email: r.email, name: r.name, createdAt: r.created_at }
-      : undefined;
+    const { rows } = await this.pool.query<PgUserRow>(
+      'SELECT id, email, name, created_at, active, external_id FROM users WHERE id = $1',
+      [id],
+    );
+    return rows[0] ? pgUser(rows[0]) : undefined;
   }
 
   async createSession(
@@ -538,18 +552,68 @@ export class PostgresMetaStore implements MetaStore {
   }
 
   async getUserByEmail(email: string): Promise<AuthUser | undefined> {
-    const { rows } = await this.pool.query<{
-      id: string;
-      email: string;
-      name: string;
-      created_at: string;
-    }>('SELECT id, email, name, created_at FROM users WHERE email = $1', [
-      email,
-    ]);
-    const r = rows[0];
-    return r
-      ? { id: r.id, email: r.email, name: r.name, createdAt: r.created_at }
-      : undefined;
+    const { rows } = await this.pool.query<PgUserRow>(
+      'SELECT id, email, name, created_at, active, external_id FROM users WHERE email = $1',
+      [email],
+    );
+    return rows[0] ? pgUser(rows[0]) : undefined;
+  }
+
+  // --- SCIM provisioning (Phase 3) -------------------------------------------
+
+  async listUsers(opts?: {
+    filter?: { userName?: string };
+  }): Promise<AuthUser[]> {
+    const { rows } =
+      opts?.filter?.userName !== undefined
+        ? await this.pool.query<PgUserRow>(
+            'SELECT id, email, name, created_at, active, external_id FROM users WHERE email = $1 ORDER BY created_at',
+            [opts.filter.userName],
+          )
+        : await this.pool.query<PgUserRow>(
+            'SELECT id, email, name, created_at, active, external_id FROM users ORDER BY created_at',
+          );
+    return rows.map(pgUser);
+  }
+
+  async getUserByExternalId(externalId: string): Promise<AuthUser | undefined> {
+    const { rows } = await this.pool.query<PgUserRow>(
+      'SELECT id, email, name, created_at, active, external_id FROM users WHERE external_id = $1',
+      [externalId],
+    );
+    return rows[0] ? pgUser(rows[0]) : undefined;
+  }
+
+  async updateUser(
+    id: string,
+    fields: { name?: string; active?: boolean; externalId?: string },
+  ): Promise<AuthUser | undefined> {
+    const sets: string[] = [];
+    const vals: unknown[] = [];
+    if (fields.name !== undefined) {
+      sets.push(`name = $${vals.length + 1}`);
+      vals.push(fields.name);
+    }
+    if (fields.active !== undefined) {
+      sets.push(`active = $${vals.length + 1}`);
+      vals.push(fields.active ? 1 : 0);
+    }
+    if (fields.externalId !== undefined) {
+      sets.push(`external_id = $${vals.length + 1}`);
+      vals.push(fields.externalId);
+    }
+    if (sets.length) {
+      vals.push(id);
+      await this.pool.query(
+        `UPDATE users SET ${sets.join(', ')} WHERE id = $${vals.length}`,
+        vals,
+      );
+    }
+    return this.getUser(id);
+  }
+
+  async deleteUserSessions(userId: string): Promise<void> {
+    await this.pool.query('DELETE FROM sessions WHERE user_id = $1', [userId]);
   }
 
   // --- Per-doc roles ----------------------------------------------------------
@@ -612,11 +676,12 @@ export class PostgresMetaStore implements MetaStore {
     name: string,
     slug: string,
     defaultRole: DocRole,
+    externalId?: string,
   ): Promise<Workspace> {
     const now = new Date().toISOString();
     await this.pool.query(
-      'INSERT INTO workspaces (id, name, slug, default_role, created_at) VALUES ($1, $2, $3, $4, $5)',
-      [id, name, slug, defaultRole, now],
+      'INSERT INTO workspaces (id, name, slug, default_role, created_at, external_id) VALUES ($1, $2, $3, $4, $5, $6)',
+      [id, name, slug, defaultRole, now, externalId ?? null],
     );
     return { id, name, slug, defaultRole, createdAt: now };
   }
@@ -625,6 +690,16 @@ export class PostgresMetaStore implements MetaStore {
     const { rows } = await this.pool.query<WorkspaceRow>(
       'SELECT * FROM workspaces WHERE id = $1',
       [id],
+    );
+    return rows[0] ? toWorkspace(rows[0]) : undefined;
+  }
+
+  async getWorkspaceByExternalId(
+    externalId: string,
+  ): Promise<Workspace | undefined> {
+    const { rows } = await this.pool.query<WorkspaceRow>(
+      'SELECT * FROM workspaces WHERE external_id = $1',
+      [externalId],
     );
     return rows[0] ? toWorkspace(rows[0]) : undefined;
   }

@@ -266,6 +266,38 @@ function metaStoreContract(makeStore: () => Promise<MetaStore>) {
     expect(await store.removeMember('ws-1', 'ws-member')).toBe(false);
   });
 
+  it('provisions users via SCIM: active toggle, filter, externalId, sessions', async () => {
+    const u = await store.upsertUser('scim-u', 'scim@example.com', 'SCIM User');
+    expect(u.active).toBe(true);
+
+    // externalId lookup + userName filter
+    await store.updateUser('scim-u', { externalId: 'idp-123' });
+    expect((await store.getUserByExternalId('idp-123'))?.id).toBe('scim-u');
+    const filtered = await store.listUsers({ filter: { userName: 'scim@example.com' } });
+    expect(filtered.map((x) => x.id)).toEqual(['scim-u']);
+    expect(await store.listUsers({ filter: { userName: 'none@example.com' } })).toEqual([]);
+
+    // deactivation flows through getUser/getUserByEmail
+    await store.createSession('scim-sess', 'scim-u', '2099-01-01T00:00:00.000Z');
+    await store.updateUser('scim-u', { active: false });
+    expect((await store.getUser('scim-u'))?.active).toBe(false);
+    expect((await store.getUserByEmail('scim@example.com'))?.active).toBe(false);
+
+    // dropping sessions signs the user out everywhere
+    await store.deleteUserSessions('scim-u');
+    expect(await store.getSession('scim-sess')).toBeUndefined();
+
+    // reactivation
+    await store.updateUser('scim-u', { active: true });
+    expect((await store.getUser('scim-u'))?.active).toBe(true);
+  });
+
+  it('links a SCIM Group to a workspace via externalId', async () => {
+    const ws = await store.createWorkspace('ws-scim', 'Eng', 'eng', 'editor', 'grp-9');
+    expect(await store.getWorkspaceByExternalId('grp-9')).toEqual(ws);
+    expect(await store.getWorkspaceByExternalId('missing')).toBeUndefined();
+  });
+
   it('assigns docs to a workspace and detaches on delete', async () => {
     await store.createWorkspace('ws-2', 'Beta', 'beta', 'editor');
     const doc = await store.create('ws-doc', 'w.md', undefined, undefined, 'ws-2');

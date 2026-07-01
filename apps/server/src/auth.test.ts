@@ -103,6 +103,33 @@ describe('resolvePrincipal', () => {
     expect(p).toMatchObject({ kind: 'user' });
   });
 
+  it('rejects a deactivated (SCIM-deprovisioned) user on session and token', async () => {
+    await store.upsertUser('u-off', 'off@example.com', 'Off');
+    const { secret } = await startSession(store, 'u-off');
+    const tokenSecret = newApiTokenSecret();
+    await store.createApiToken({
+      id: 'tok-off',
+      userId: 'u-off',
+      name: 'bot',
+      scope: 'read',
+      tokenHash: sha256(tokenSecret),
+    });
+    // Active: both credentials resolve.
+    expect(
+      await resolvePrincipal(store, { cookieHeader: `${SESSION_COOKIE}=${secret}` }),
+    ).toMatchObject({ kind: 'user' });
+    expect(await resolvePrincipal(store, { bearer: tokenSecret })).toMatchObject({
+      kind: 'agent',
+    });
+
+    await store.updateUser('u-off', { active: false });
+    // Deprovisioned: locked out of both surfaces.
+    expect(
+      await resolvePrincipal(store, { cookieHeader: `${SESSION_COOKIE}=${secret}` }),
+    ).toBeNull();
+    expect(await resolvePrincipal(store, { bearer: tokenSecret })).toBeNull();
+  });
+
   it('formats the session cookie', () => {
     expect(sessionCookie('abc', { secure: false })).toBe(
       `${SESSION_COOKIE}=abc; HttpOnly; Path=/; Max-Age=2592000; SameSite=Lax`,
