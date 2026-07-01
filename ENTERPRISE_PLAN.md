@@ -133,6 +133,18 @@ by an enterprise today.
      service, scaled `server` replicas with no host port, and a WS-aware nginx
      `lb` owning `:4000`); `MARKUP_TRUST_PROXY` for correct client IPs behind
      the LB. The per-user WS connection cap stays in-process (a per-node guard).
-   - Remaining: k6 load testing.
-4. **Phase 3 (enterprise polish)**: SAML/SCIM, audit log export, admin
-   console, retention policies, compliance paperwork.
+   - **Slice 4 — k6 load testing (shipped; see PHASE2_OPS.md).** `k6/ws.js`
+     (connection capacity) + `k6/rest.js` (throughput) over a hand-rolled
+     minimal Hocuspocus wire codec, with a manual `workflow_dispatch` CI job.
+     Phase 2 is complete.
+4. **Phase 3 (enterprise polish)**: workspaces, SAML/SCIM, audit log export,
+   admin console, retention policies, compliance paperwork.
+   - **Slice 1 — workspaces (shipped; see PHASE3_WORKSPACES.md).** A
+     workspace → docs membership layer: `workspaces` + `workspace_members`
+     tables, `doc_meta.workspace_id`, and the whole access impact centralized
+     in `auth.roleFor` (workspace admins act as owner over the workspace's
+     docs; members get the workspace's `default_role` baseline, promotable by
+     an owner's ACL grant). `/api/workspaces` route family + a `workspaceId`
+     branch on `PATCH /api/docs/:id`. Server + REST + tests; the workspace web
+     UI rides with the admin-console slice.
+   - Remaining: workspace web UI, SAML/SCIM, audit log export, admin console.

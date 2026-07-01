@@ -139,12 +139,20 @@ export function roleScope(role: DocRole | 'none'): TokenScope | null {
   }
 }
 
+/** Return the stronger (higher-capability) of two doc roles. */
+export function strongerRole(a: DocRole, b: DocRole): DocRole {
+  const rank = (r: DocRole) => SCOPES.indexOf(roleScope(r) as TokenScope);
+  return rank(a) >= rank(b) ? a : b;
+}
+
 /**
  * Resolve a principal's role on a doc: legacy principals act as owner (until
- * MARKUP_REQUIRE_AUTH retires them); the creator is owner; explicit ACL
- * entries next; otherwise the doc's link role (default editor — open
- * collaboration). Docs from before identity existed have no owner and stay
- * open.
+ * MARKUP_REQUIRE_AUTH retires them); the creator is owner; a workspace admin
+ * acts as owner over the workspace's docs; otherwise the strongest of the
+ * explicit ACL grant and the workspace baseline (so an owner's grant can
+ * promote a member above the default); otherwise the doc's link role (default
+ * editor — open collaboration). Docs from before identity existed have no
+ * owner and stay open.
  */
 export async function roleFor(
   meta: MetaStore,
@@ -154,8 +162,24 @@ export async function roleFor(
   if (principal.kind === 'legacy') return 'owner';
   const userId = principal.user.id;
   if (doc.ownerId === userId) return 'owner';
+
+  // Workspace membership: admins act as owner; members get the workspace's
+  // baseline role, which an explicit ACL grant may promote above.
+  let workspaceBaseline: DocRole | undefined;
+  if (doc.workspaceId) {
+    const membership = await meta.getMembership(doc.workspaceId, userId);
+    if (membership === 'admin') return 'owner';
+    if (membership === 'member') {
+      const ws = await meta.getWorkspace(doc.workspaceId);
+      workspaceBaseline = ws?.defaultRole;
+    }
+  }
+
   const acl = await meta.getAclRole(doc.docId, userId);
+  if (acl && workspaceBaseline) return strongerRole(acl, workspaceBaseline);
   if (acl) return acl;
+  if (workspaceBaseline) return workspaceBaseline;
+
   if (!doc.ownerId) return 'editor';
   return doc.linkRole ?? 'editor';
 }

@@ -40,4 +40,8 @@ export type {
   MeResponse,
   DocRole,
   AclEntry,
+  WorkspaceRole,
+  Workspace,
+  WorkspaceMember,
+  WorkspaceWithRole,
 } from './types.js';

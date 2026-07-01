@@ -111,6 +111,11 @@ reach every connected human (and the CLI daemon → disk) in realtime:
 - `GET /api/me` · `GET|POST /api/tokens` · `DELETE /api/tokens/:id`
 - `GET|POST /api/docs/:id/permissions` · `DELETE .../permissions/:userId` ·
   `PUT .../permissions/link` (owner only)
+- `GET|POST /api/workspaces` · `GET|PATCH|DELETE /api/workspaces/:id` ·
+  `GET|POST .../members` · `PATCH|DELETE .../members/:userId` — workspaces
+  (Phase 3); create makes you admin, admin manages members/`defaultRole`.
+  `PATCH /api/docs/:id {workspaceId}` moves a doc into/out of a workspace
+  (owner only, into a workspace you belong to)
 - `GET /api/git/status` · `GET /api/git/branches` · `POST /api/git/commit`
   `{message,paths?}` · `POST /api/git/branch` `{name,checkout?}` ·
   `POST /api/git/checkout` `{name}` — only when `MARKUP_REPO_DIR` is set (404
@@ -180,7 +185,16 @@ connections (`closeConnections(docId)`), providers reconnect and re-resolve
 the role, and the web client refetches `myRole` on every `synced` event
 (revoked users land on an access-revoked screen). `MARKUP_REQUIRE_AUTH=1` disables the legacy shared token entirely.
 Legacy principals and pre-identity (unowned) docs behave as before: full
-access, open collaboration. Signed-in humans are stamped with real name + `authorId` on
+access, open collaboration. **Workspaces** (Phase 3, see PHASE3_WORKSPACES.md):
+a doc may belong to one workspace (`doc_meta.workspace_id`); `workspace_members`
+maps user→`admin`/`member`. The whole access impact is centralized in
+`roleFor()` (so it reaches REST + WS unchanged): a workspace admin acts as
+`owner` over the workspace's docs, a plain member gets the workspace's
+`default_role` baseline, and an owner's explicit ACL grant can promote a member
+above it (`strongerRole`). Managed via the `/api/workspaces` routes (create →
+admin; admin manages members and `defaultRole`; last-admin protected); deleting
+a workspace detaches its docs rather than orphaning them. Signed-in humans are
+stamped with real name + `authorId` on
 comments/suggestions; self-reported names are ignored. Web uses
 `NEXT_PUBLIC_MARKUP_TOKEN` as fallback plus the session cookie
 (`credentials: 'include'`; CORS locked to `MARKUP_WEB_ORIGIN`, default
@@ -375,7 +389,8 @@ way), mono accents (CSS vars in `globals.css`).
    server-side REST/WS enforcement, MARKUP_REQUIRE_AUTH; see
    PHASE1_IDENTITY.md), plus the role-aware web UI (Share popover, role
    badge, read-only editor below editor role with REST-backed annotations).
-   Remaining: workspace membership, SAML/SCIM.
+   Workspace membership shipped as Phase 3 slice 1 (server + REST; see
+   PHASE3_WORKSPACES.md). Remaining: workspace web UI, SAML/SCIM.
 2. **Enterprise Phase 2 (scale/ops)** — observability + self-protection
    limits shipped (structured logs, `/metrics`, `/readyz`, REST rate limiting,
    per-user WS caps, doc byte-size guard); plus history retention + backups

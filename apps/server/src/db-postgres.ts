@@ -7,6 +7,10 @@ import type {
   DocRole,
   TokenScope,
   VersionMeta,
+  Workspace,
+  WorkspaceMember,
+  WorkspaceRole,
+  WorkspaceWithRole,
 } from '@markup/sync-core';
 import type {
   ApiTokenRow,
@@ -78,6 +82,23 @@ const MIGRATIONS: string[] = [
   `ALTER TABLE doc_versions ADD COLUMN name TEXT`,
   `ALTER TABLE doc_versions ADD COLUMN author TEXT`,
   `ALTER TABLE doc_versions ADD COLUMN author_id TEXT`,
+  // Phase 3: workspaces (a doc may belong to one; membership grants a baseline
+  // doc role and admins act as owner — see auth.roleFor).
+  `CREATE TABLE workspaces (
+     id TEXT PRIMARY KEY,
+     name TEXT NOT NULL,
+     slug TEXT NOT NULL UNIQUE,
+     default_role TEXT NOT NULL,
+     created_at TEXT NOT NULL
+   )`,
+  `CREATE TABLE workspace_members (
+     workspace_id TEXT NOT NULL,
+     user_id TEXT NOT NULL,
+     role TEXT NOT NULL,
+     created_at TEXT NOT NULL,
+     PRIMARY KEY (workspace_id, user_id)
+   )`,
+  `ALTER TABLE doc_meta ADD COLUMN workspace_id TEXT`,
 ];
 
 const MIGRATION_LOCK_KEY = 0x6d61726b; // arbitrary app-wide advisory lock id
@@ -147,6 +168,7 @@ interface MetaRow {
   updated_at: string;
   owner_id: string | null;
   link_role: string | null;
+  workspace_id: string | null;
 }
 
 function toMeta(row: MetaRow): DocMeta {
@@ -158,6 +180,25 @@ function toMeta(row: MetaRow): DocMeta {
     updatedAt: row.updated_at,
     ownerId: row.owner_id ?? undefined,
     linkRole: (row.link_role as DocMeta['linkRole']) ?? undefined,
+    workspaceId: row.workspace_id ?? undefined,
+  };
+}
+
+interface WorkspaceRow {
+  id: string;
+  name: string;
+  slug: string;
+  default_role: string;
+  created_at: string;
+}
+
+function toWorkspace(row: WorkspaceRow): Workspace {
+  return {
+    id: row.id,
+    name: row.name,
+    slug: row.slug,
+    defaultRole: row.default_role as DocRole,
+    createdAt: row.created_at,
   };
 }
 
@@ -173,13 +214,22 @@ export class PostgresMetaStore implements MetaStore {
     name: string,
     path?: string,
     ownerId?: string,
+    workspaceId?: string,
   ): Promise<DocMeta> {
     const now = new Date().toISOString();
     await this.pool.query(
-      'INSERT INTO doc_meta (doc_id, name, path, created_at, updated_at, owner_id) VALUES ($1, $2, $3, $4, $5, $6)',
-      [docId, name, path ?? null, now, now, ownerId ?? null],
+      'INSERT INTO doc_meta (doc_id, name, path, created_at, updated_at, owner_id, workspace_id) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+      [docId, name, path ?? null, now, now, ownerId ?? null, workspaceId ?? null],
     );
-    return { docId, name, path, createdAt: now, updatedAt: now, ownerId };
+    return {
+      docId,
+      name,
+      path,
+      createdAt: now,
+      updatedAt: now,
+      ownerId,
+      workspaceId,
+    };
   }
 
   async get(docId: string): Promise<DocMeta | undefined> {
@@ -509,6 +559,169 @@ export class PostgresMetaStore implements MetaStore {
     await this.pool.query(
       'UPDATE doc_meta SET link_role = $1 WHERE doc_id = $2',
       [role, docId],
+    );
+  }
+
+  // --- Workspaces -------------------------------------------------------------
+
+  async createWorkspace(
+    id: string,
+    name: string,
+    slug: string,
+    defaultRole: DocRole,
+  ): Promise<Workspace> {
+    const now = new Date().toISOString();
+    await this.pool.query(
+      'INSERT INTO workspaces (id, name, slug, default_role, created_at) VALUES ($1, $2, $3, $4, $5)',
+      [id, name, slug, defaultRole, now],
+    );
+    return { id, name, slug, defaultRole, createdAt: now };
+  }
+
+  async getWorkspace(id: string): Promise<Workspace | undefined> {
+    const { rows } = await this.pool.query<WorkspaceRow>(
+      'SELECT * FROM workspaces WHERE id = $1',
+      [id],
+    );
+    return rows[0] ? toWorkspace(rows[0]) : undefined;
+  }
+
+  async getWorkspaceBySlug(slug: string): Promise<Workspace | undefined> {
+    const { rows } = await this.pool.query<WorkspaceRow>(
+      'SELECT * FROM workspaces WHERE slug = $1',
+      [slug],
+    );
+    return rows[0] ? toWorkspace(rows[0]) : undefined;
+  }
+
+  async listWorkspacesForUser(userId: string): Promise<WorkspaceWithRole[]> {
+    const { rows } = await this.pool.query<
+      WorkspaceRow & { member_role: WorkspaceRole }
+    >(
+      `SELECT w.*, m.role AS member_role
+       FROM workspace_members m JOIN workspaces w ON w.id = m.workspace_id
+       WHERE m.user_id = $1 ORDER BY w.name`,
+      [userId],
+    );
+    return rows.map((r) => ({ ...toWorkspace(r), role: r.member_role }));
+  }
+
+  async updateWorkspace(
+    id: string,
+    fields: { name?: string; defaultRole?: DocRole },
+  ): Promise<Workspace | undefined> {
+    const sets: string[] = [];
+    const vals: unknown[] = [];
+    if (fields.name !== undefined) {
+      sets.push(`name = $${vals.length + 1}`);
+      vals.push(fields.name);
+    }
+    if (fields.defaultRole !== undefined) {
+      sets.push(`default_role = $${vals.length + 1}`);
+      vals.push(fields.defaultRole);
+    }
+    if (sets.length) {
+      vals.push(id);
+      await this.pool.query(
+        `UPDATE workspaces SET ${sets.join(', ')} WHERE id = $${vals.length}`,
+        vals,
+      );
+    }
+    return this.getWorkspace(id);
+  }
+
+  async deleteWorkspace(id: string): Promise<boolean> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        'UPDATE doc_meta SET workspace_id = NULL WHERE workspace_id = $1',
+        [id],
+      );
+      await client.query('DELETE FROM workspace_members WHERE workspace_id = $1', [
+        id,
+      ]);
+      const res = await client.query('DELETE FROM workspaces WHERE id = $1', [id]);
+      await client.query('COMMIT');
+      return (res.rowCount ?? 0) > 0;
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  async addMember(
+    workspaceId: string,
+    userId: string,
+    role: WorkspaceRole,
+  ): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO workspace_members (workspace_id, user_id, role, created_at)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (workspace_id, user_id) DO UPDATE SET role = EXCLUDED.role`,
+      [workspaceId, userId, role, new Date().toISOString()],
+    );
+  }
+
+  async getMembership(
+    workspaceId: string,
+    userId: string,
+  ): Promise<WorkspaceRole | undefined> {
+    const { rows } = await this.pool.query<{ role: WorkspaceRole }>(
+      'SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2',
+      [workspaceId, userId],
+    );
+    return rows[0]?.role;
+  }
+
+  async listMembers(workspaceId: string): Promise<WorkspaceMember[]> {
+    const { rows } = await this.pool.query<{
+      user_id: string;
+      role: WorkspaceRole;
+      email: string | null;
+      name: string | null;
+    }>(
+      `SELECT m.user_id, m.role, u.email, u.name
+       FROM workspace_members m LEFT JOIN users u ON u.id = m.user_id
+       WHERE m.workspace_id = $1 ORDER BY u.email`,
+      [workspaceId],
+    );
+    return rows.map((r) => ({
+      userId: r.user_id,
+      role: r.role,
+      email: r.email ?? undefined,
+      name: r.name ?? undefined,
+    }));
+  }
+
+  async countMembersWithRole(
+    workspaceId: string,
+    role: WorkspaceRole,
+  ): Promise<number> {
+    const { rows } = await this.pool.query<{ n: string }>(
+      'SELECT COUNT(*) AS n FROM workspace_members WHERE workspace_id = $1 AND role = $2',
+      [workspaceId, role],
+    );
+    return Number(rows[0]?.n ?? 0);
+  }
+
+  async removeMember(workspaceId: string, userId: string): Promise<boolean> {
+    const res = await this.pool.query(
+      'DELETE FROM workspace_members WHERE workspace_id = $1 AND user_id = $2',
+      [workspaceId, userId],
+    );
+    return (res.rowCount ?? 0) > 0;
+  }
+
+  async setDocWorkspace(
+    docId: string,
+    workspaceId: string | null,
+  ): Promise<void> {
+    await this.pool.query(
+      'UPDATE doc_meta SET workspace_id = $1 WHERE doc_id = $2',
+      [workspaceId, docId],
     );
   }
 
