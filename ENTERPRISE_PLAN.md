@@ -151,4 +151,12 @@ by an enterprise today.
      a Workspace selector in the owner's Share popover to move a doc into/out
      of a workspace (`lib/workspaces.ts`, `WorkspacesPanel.tsx`, `SharePanel`).
      Web only — drives the slice-1 routes unchanged.
-   - Remaining: SAML/SCIM, audit log export, admin console.
+   - **Slice 3 — audit log (shipped; see PHASE3_AUDIT.md).** Per-workspace
+     `audit_log` table on both backends recording administrative actions
+     (workspace/member changes, doc attach/detach) via a best-effort `audit()`
+     side-call; `MetaStore.appendAudit`/`listAudit` (newest-first, keyset
+     pagination); `GET /api/workspaces/:id/audit` (admin only, `?format=csv`
+     export); cascade-deletes with its workspace. Content edits stay out of
+     scope (covered by `doc_versions` + the event stream). Server + REST +
+     tests; audit-log web UI rides with the admin console.
+   - Remaining: SAML/SCIM, admin console.
