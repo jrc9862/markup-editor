@@ -282,6 +282,66 @@ function metaStoreContract(makeStore: () => Promise<MetaStore>) {
     expect((await store.get('ws-doc'))?.workspaceId).toBeUndefined();
   });
 
+  it('appends and paginates audit entries, newest first', async () => {
+    await store.createWorkspace('ws-a', 'Audited', 'audited', 'editor');
+    const first = await store.appendAudit({
+      workspaceId: 'ws-a',
+      ts: '2026-07-01T00:00:00.000Z',
+      actorId: 'u-1',
+      actorName: 'Alice',
+      action: 'workspace.create',
+      targetType: 'workspace',
+      targetId: 'ws-a',
+      detail: { name: 'Audited' },
+    });
+    expect(first.id).toBeGreaterThan(0);
+    for (let i = 0; i < 3; i++) {
+      await store.appendAudit({
+        workspaceId: 'ws-a',
+        ts: '2026-07-01T00:00:01.000Z',
+        action: 'member.add',
+        targetType: 'member',
+        targetId: `u-${i}`,
+      });
+    }
+    // Entries scoped to another workspace never leak in.
+    await store.appendAudit({
+      workspaceId: 'ws-other',
+      ts: '2026-07-01T00:00:02.000Z',
+      action: 'member.add',
+      targetType: 'member',
+      targetId: 'u-x',
+    });
+
+    const all = await store.listAudit('ws-a');
+    expect(all).toHaveLength(4);
+    // Newest first (descending id), detail round-trips as an object.
+    expect(all[0].action).toBe('member.add');
+    expect(all[3].action).toBe('workspace.create');
+    expect(all[3].detail).toEqual({ name: 'Audited' });
+    expect(all[3].actorName).toBe('Alice');
+
+    const page = await store.listAudit('ws-a', { limit: 2 });
+    expect(page).toHaveLength(2);
+    const next = await store.listAudit('ws-a', { limit: 2, before: page[1].id });
+    expect(next).toHaveLength(2);
+    expect(next[0].id).toBeLessThan(page[1].id);
+  });
+
+  it('cascade-deletes a workspace audit log when the workspace is deleted', async () => {
+    await store.createWorkspace('ws-del', 'Doomed', 'doomed', 'editor');
+    await store.appendAudit({
+      workspaceId: 'ws-del',
+      ts: '2026-07-01T00:00:00.000Z',
+      action: 'workspace.create',
+      targetType: 'workspace',
+      targetId: 'ws-del',
+    });
+    expect(await store.listAudit('ws-del')).toHaveLength(1);
+    await store.deleteWorkspace('ws-del');
+    expect(await store.listAudit('ws-del')).toHaveLength(0);
+  });
+
   it('ping resolves while the store is reachable', async () => {
     await expect(store.ping()).resolves.toBeUndefined();
   });
@@ -299,7 +359,7 @@ describe.skipIf(!DATABASE_URL)('PostgresMetaStore', () => {
   beforeAll(async () => {
     // Tests own the schema: start clean so the contract's fixed ids work.
     await pool.query(
-      'DROP TABLE IF EXISTS doc_meta, doc_versions, documents, users, sessions, api_tokens, doc_acl, workspaces, workspace_members, schema_migrations CASCADE',
+      'DROP TABLE IF EXISTS doc_meta, doc_versions, documents, users, sessions, api_tokens, doc_acl, workspaces, workspace_members, audit_log, schema_migrations CASCADE',
     );
   });
 

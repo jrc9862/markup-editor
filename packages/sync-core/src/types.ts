@@ -139,6 +139,47 @@ export interface WorkspaceWithRole extends Workspace {
   role: WorkspaceRole;
 }
 
+// --- Audit log (Phase 3) ------------------------------------------------------
+
+/**
+ * A recorded workspace-administrative action. The audit log captures
+ * security-relevant changes to a *live* workspace (its settings, membership,
+ * and which docs belong to it) so an admin can review who did what. Content
+ * edits are deliberately out of scope — edit history (`doc_versions`) and the
+ * realtime event stream already cover those.
+ */
+export type AuditAction =
+  | 'workspace.create'
+  | 'workspace.update'
+  | 'member.add'
+  | 'member.update'
+  | 'member.remove'
+  | 'doc.attach'
+  | 'doc.detach';
+
+/** What an audit entry's `targetId` refers to. */
+export type AuditTargetType = 'workspace' | 'member' | 'doc';
+
+/** One entry in a workspace's audit log. */
+export interface AuditEntry {
+  /** Monotonic id; also the pagination cursor (`before`). */
+  id: number;
+  /** The workspace the action happened in. */
+  workspaceId: string;
+  /** ISO timestamp. */
+  ts: string;
+  /** Stable user id of the actor, when known. */
+  actorId?: string;
+  /** Display name of the actor, denormalized for stable history. */
+  actorName?: string;
+  action: AuditAction;
+  targetType: AuditTargetType;
+  /** userId (member.*) or docId (doc.*); absent for workspace-level actions. */
+  targetId?: string;
+  /** Extra structured context (e.g. old/new role, name). */
+  detail?: Record<string, unknown>;
+}
+
 /** Response of GET /api/me: who the current credentials belong to. */
 export interface MeResponse {
   /** user = session cookie; agent = API token; legacy = shared MARKUP_TOKEN. */
