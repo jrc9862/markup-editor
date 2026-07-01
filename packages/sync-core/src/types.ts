@@ -22,6 +22,12 @@ export interface DocMeta {
   linkRole?: DocRole | 'none';
   /** The requesting principal's resolved role (GET /api/docs/:id only). */
   myRole?: DocRole | 'none';
+  /**
+   * Workspace the doc belongs to (Phase 3). Absent = a personal/legacy doc,
+   * governed solely by owner/ACL/link-role. When set, workspace admins act as
+   * owner and members get the workspace's baseline role (see `roleFor`).
+   */
+  workspaceId?: string;
 }
 
 /** Request body for creating a document. */
@@ -96,6 +102,41 @@ export interface AclEntry {
   /** Joined for display. */
   email?: string;
   name?: string;
+}
+
+// --- Workspaces (Phase 3) -----------------------------------------------------
+
+/**
+ * Membership level within a workspace. `admin` manages members and acts as
+ * owner over every doc in the workspace; `member` gets the workspace's
+ * `defaultRole` on those docs (an owner's explicit ACL grant can promote a
+ * member above that baseline).
+ */
+export type WorkspaceRole = 'admin' | 'member';
+
+/** A workspace: an org/membership container that owns a set of docs. */
+export interface Workspace {
+  id: string;
+  name: string;
+  /** URL-safe unique handle. */
+  slug: string;
+  /** Baseline doc role a plain member gets on the workspace's docs. */
+  defaultRole: DocRole;
+  createdAt: string;
+}
+
+/** One workspace membership (joined with the user for display). */
+export interface WorkspaceMember {
+  userId: string;
+  role: WorkspaceRole;
+  /** Joined for display. */
+  email?: string;
+  name?: string;
+}
+
+/** A workspace paired with the requesting user's membership role. */
+export interface WorkspaceWithRole extends Workspace {
+  role: WorkspaceRole;
 }
 
 /** Response of GET /api/me: who the current credentials belong to. */

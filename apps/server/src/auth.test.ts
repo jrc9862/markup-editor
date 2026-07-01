@@ -169,3 +169,60 @@ describe('roles', () => {
     expect(await effectiveScope(store, asUser('stranger'), doc)).toBeNull();
   });
 });
+
+describe('roleFor with workspaces', () => {
+  const store = new SqliteMetaStore(':memory:');
+  const asUser = (id: string): Principal => ({
+    kind: 'user',
+    user: { id, email: `${id}@x.com`, name: id, createdAt: '' },
+    scope: 'write',
+  });
+
+  beforeAll(async () => {
+    await store.init();
+    for (const id of ['owner', 'admin', 'member', 'stranger']) {
+      await store.upsertUser(id, `${id}@x.com`, id);
+    }
+    await store.createWorkspace('ws', 'Acme', 'acme', 'suggester');
+    await store.addMember('ws', 'admin', 'admin');
+    await store.addMember('ws', 'member', 'member');
+  });
+
+  afterAll(async () => {
+    await store.close();
+  });
+
+  it('workspace admin acts as owner; members get the baseline; non-members follow link role', async () => {
+    const doc = await store.create('wd', 'w.md', undefined, 'owner', 'ws');
+    // doc owner keeps ownership even inside a workspace
+    expect(await roleFor(store, asUser('owner'), doc)).toBe('owner');
+    // admin override
+    expect(await roleFor(store, asUser('admin'), doc)).toBe('owner');
+    // member gets the workspace's defaultRole
+    expect(await roleFor(store, asUser('member'), doc)).toBe('suggester');
+    // non-member falls through to the link role (default editor)
+    expect(await roleFor(store, asUser('stranger'), doc)).toBe('editor');
+  });
+
+  it('an owner ACL grant promotes a member above the workspace baseline', async () => {
+    await store.setAclRole('wd', 'member', 'editor');
+    const doc = (await store.get('wd'))!;
+    // stronger of ACL (editor) and baseline (suggester) wins
+    expect(await roleFor(store, asUser('member'), doc)).toBe('editor');
+  });
+
+  it('the workspace baseline still applies when the ACL grant is weaker', async () => {
+    await store.setAclRole('wd', 'member', 'viewer');
+    const doc = (await store.get('wd'))!;
+    // baseline suggester beats a weaker viewer grant
+    expect(await roleFor(store, asUser('member'), doc)).toBe('suggester');
+  });
+
+  it('detaching the doc from the workspace drops membership-derived roles', async () => {
+    await store.setDocWorkspace('wd', null);
+    const doc = (await store.get('wd'))!;
+    expect(await roleFor(store, asUser('admin'), doc)).toBe('editor'); // link role
+    // member keeps only its explicit ACL grant (viewer, set above)
+    expect(await roleFor(store, asUser('member'), doc)).toBe('viewer');
+  });
+});

@@ -28,7 +28,14 @@ import {
   rejectSuggestion,
   snapshotSuggestions,
 } from '@markup/sync-core';
-import type { CreateDocRequest, DocMeta, TokenScope } from '@markup/sync-core';
+import type {
+  CreateDocRequest,
+  DocMeta,
+  DocRole,
+  TokenScope,
+  Workspace,
+  WorkspaceRole,
+} from '@markup/sync-core';
 import {
   SqliteMetaStore,
   type MetaStore,
@@ -524,16 +531,54 @@ app.patch('/api/docs/:docId', needs('write'), docAccess('write'), async (req, re
     }
     fields.path = clean;
   }
-  if (fields.name === undefined && fields.path === undefined) {
-    res.status(400).json({ error: 'name or path is required' });
+  const wsGiven = 'workspaceId' in body;
+  if (fields.name === undefined && fields.path === undefined && !wsGiven) {
+    res.status(400).json({ error: 'name, path, or workspaceId is required' });
     return;
   }
-  const updated = await meta.rename(req.params.docId, fields);
+
+  const p = res.locals.principal as Principal;
+  // Moving a doc between workspaces is an ownership decision (doc owner, or a
+  // workspace admin who resolves as owner). The target must be a workspace the
+  // caller belongs to, so a doc can't be dumped into a workspace you're not in.
+  if (wsGiven) {
+    const doc = res.locals.docMeta as DocMeta;
+    if ((await roleFor(meta, p, doc)) !== 'owner') {
+      res.status(403).json({ error: 'only the doc owner can change its workspace' });
+      return;
+    }
+    const target = (body as { workspaceId?: string | null }).workspaceId;
+    if (target != null) {
+      if (typeof target !== 'string') {
+        res.status(400).json({ error: 'workspaceId must be a string or null' });
+        return;
+      }
+      if (p.kind === 'legacy') {
+        res.status(403).json({ error: 'workspace requires a signed-in identity' });
+        return;
+      }
+      const membership = await meta.getMembership(target, p.user.id);
+      if (!membership) {
+        res.status(403).json({ error: 'not a member of the target workspace' });
+        return;
+      }
+    }
+    await meta.setDocWorkspace(req.params.docId, target ?? null);
+  }
+
+  if (fields.name !== undefined || fields.path !== undefined) {
+    const renamed = await meta.rename(req.params.docId, fields);
+    if (!renamed) {
+      res.status(404).json({ error: 'not found' });
+      return;
+    }
+  }
+  const updated = await meta.get(req.params.docId);
   if (!updated) {
     res.status(404).json({ error: 'not found' });
     return;
   }
-  const p = res.locals.principal as Principal;
+  if (wsGiven) kickDocConnections(req.params.docId);
   res.json({ ...updated, myRole: await roleFor(meta, p, updated) });
 });
 
@@ -1103,6 +1148,238 @@ app.put('/api/docs/:docId/permissions/link', ownerOnly, async (req, res) => {
   kickDocConnections(req.params.docId);
   res.json({ ok: true });
 });
+
+// --- Workspaces (Phase 3) -----------------------------------------------------
+//
+// A workspace is an org/membership container that can own docs. Membership is
+// admin | member; the access impact is centralized in auth.roleFor (admins act
+// as owner over the workspace's docs, members get its defaultRole). These
+// routes manage the workspace and its members; a real user identity is
+// required (the legacy shared token has none).
+
+function isWorkspaceRole(r: unknown): r is WorkspaceRole {
+  return r === 'admin' || r === 'member';
+}
+
+/** Derive a URL-safe handle from a name/slug input. */
+function slugify(s: string): string {
+  return s
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 64);
+}
+
+/** Gate on workspace membership: 404 if missing, 403 below the required level. */
+const wsAccess =
+  (level: WorkspaceRole): express.RequestHandler =>
+  async (req, res, next) => {
+    const ws = await meta.getWorkspace(req.params.wsId);
+    if (!ws) {
+      res.status(404).json({ error: 'not found' });
+      return;
+    }
+    const p = res.locals.principal as Principal;
+    if (p.kind === 'legacy') {
+      res.status(403).json({ error: 'workspace requires a signed-in identity' });
+      return;
+    }
+    const role = await meta.getMembership(ws.id, p.user.id);
+    if (!role || (level === 'admin' && role !== 'admin')) {
+      res.status(403).json({ error: `requires workspace ${level}` });
+      return;
+    }
+    res.locals.workspace = ws;
+    res.locals.wsRole = role;
+    next();
+  };
+
+/** Workspaces the caller belongs to (empty for the identity-less legacy token). */
+app.get('/api/workspaces', needs('read'), async (_req, res) => {
+  const p = res.locals.principal as Principal;
+  if (p.kind === 'legacy') {
+    res.json([]);
+    return;
+  }
+  res.json(await meta.listWorkspacesForUser(p.user.id));
+});
+
+/** Create a workspace; the creator becomes its first admin. */
+app.post('/api/workspaces', needs('write'), async (req, res) => {
+  const p = res.locals.principal as Principal;
+  if (p.kind === 'legacy') {
+    res.status(403).json({ error: 'workspace requires a signed-in identity' });
+    return;
+  }
+  const body = req.body as { name?: string; slug?: string; defaultRole?: string };
+  if (typeof body?.name !== 'string' || !body.name.trim()) {
+    res.status(400).json({ error: 'name is required' });
+    return;
+  }
+  const defaultRole = body.defaultRole ?? 'editor';
+  if (!isRole(defaultRole)) {
+    res
+      .status(400)
+      .json({ error: 'defaultRole must be editor|suggester|commenter|viewer' });
+    return;
+  }
+  const slug = slugify(body.slug ?? body.name);
+  if (!slug) {
+    res.status(400).json({ error: 'invalid slug' });
+    return;
+  }
+  if (await meta.getWorkspaceBySlug(slug)) {
+    res.status(409).json({ error: 'slug already taken' });
+    return;
+  }
+  const ws = await meta.createWorkspace(uuidv4(), body.name.trim(), slug, defaultRole);
+  await meta.addMember(ws.id, p.user.id, 'admin');
+  res.status(201).json({ ...ws, role: 'admin' });
+});
+
+app.get('/api/workspaces/:wsId', needs('read'), wsAccess('member'), (_req, res) => {
+  res.json({ ...(res.locals.workspace as Workspace), role: res.locals.wsRole });
+});
+
+app.patch('/api/workspaces/:wsId', needs('write'), wsAccess('admin'), async (req, res) => {
+  const body = req.body as { name?: string; defaultRole?: string };
+  const fields: { name?: string; defaultRole?: DocRole } = {};
+  if (body.name !== undefined) {
+    if (typeof body.name !== 'string' || !body.name.trim()) {
+      res.status(400).json({ error: 'name must be a non-empty string' });
+      return;
+    }
+    fields.name = body.name.trim();
+  }
+  if (body.defaultRole !== undefined) {
+    if (!isRole(body.defaultRole)) {
+      res
+        .status(400)
+        .json({ error: 'defaultRole must be editor|suggester|commenter|viewer' });
+      return;
+    }
+    fields.defaultRole = body.defaultRole;
+  }
+  if (fields.name === undefined && fields.defaultRole === undefined) {
+    res.status(400).json({ error: 'name or defaultRole is required' });
+    return;
+  }
+  const updated = await meta.updateWorkspace(req.params.wsId, fields);
+  // A defaultRole change alters members' effective doc roles; re-resolve live.
+  if (fields.defaultRole !== undefined) kickWorkspaceDocs(req.params.wsId);
+  res.json(updated);
+});
+
+app.delete('/api/workspaces/:wsId', needs('write'), wsAccess('admin'), async (req, res) => {
+  await kickWorkspaceDocsAndDetach(req.params.wsId);
+  res.json({ ok: true });
+});
+
+app.get(
+  '/api/workspaces/:wsId/members',
+  needs('read'),
+  wsAccess('member'),
+  async (req, res) => {
+    res.json(await meta.listMembers(req.params.wsId));
+  },
+);
+
+/** Add a member by email or id (existing user), defaulting to plain member. */
+app.post(
+  '/api/workspaces/:wsId/members',
+  needs('write'),
+  wsAccess('admin'),
+  async (req, res) => {
+    const body = req.body as { email?: string; userId?: string; role?: string };
+    const role: WorkspaceRole = body.role === undefined ? 'member' : (body.role as WorkspaceRole);
+    if (!isWorkspaceRole(role)) {
+      res.status(400).json({ error: 'role must be admin|member' });
+      return;
+    }
+    const user = body.userId
+      ? await meta.getUser(body.userId)
+      : body.email
+        ? await meta.getUserByEmail(body.email)
+        : undefined;
+    if (!user) {
+      res.status(404).json({ error: 'no such user' });
+      return;
+    }
+    await meta.addMember(req.params.wsId, user.id, role);
+    kickWorkspaceDocs(req.params.wsId);
+    res.status(201).json({ userId: user.id, role });
+  },
+);
+
+app.patch(
+  '/api/workspaces/:wsId/members/:userId',
+  needs('write'),
+  wsAccess('admin'),
+  async (req, res) => {
+    const role = (req.body as { role?: string }).role;
+    if (!isWorkspaceRole(role)) {
+      res.status(400).json({ error: 'role must be admin|member' });
+      return;
+    }
+    const current = await meta.getMembership(req.params.wsId, req.params.userId);
+    if (!current) {
+      res.status(404).json({ error: 'not a member' });
+      return;
+    }
+    // Don't let the workspace lose its last admin.
+    if (current === 'admin' && role === 'member') {
+      if ((await meta.countMembersWithRole(req.params.wsId, 'admin')) <= 1) {
+        res.status(409).json({ error: 'workspace must keep at least one admin' });
+        return;
+      }
+    }
+    await meta.addMember(req.params.wsId, req.params.userId, role);
+    kickWorkspaceDocs(req.params.wsId);
+    res.json({ userId: req.params.userId, role });
+  },
+);
+
+app.delete(
+  '/api/workspaces/:wsId/members/:userId',
+  needs('write'),
+  wsAccess('admin'),
+  async (req, res) => {
+    const current = await meta.getMembership(req.params.wsId, req.params.userId);
+    if (!current) {
+      res.status(404).json({ error: 'not found' });
+      return;
+    }
+    if (current === 'admin') {
+      if ((await meta.countMembersWithRole(req.params.wsId, 'admin')) <= 1) {
+        res.status(409).json({ error: 'workspace must keep at least one admin' });
+        return;
+      }
+    }
+    await meta.removeMember(req.params.wsId, req.params.userId);
+    kickWorkspaceDocs(req.params.wsId);
+    res.json({ ok: true });
+  },
+);
+
+/**
+ * A workspace change (membership/defaultRole) shifts effective doc roles, so
+ * kick the live connections on the workspace's docs — they reconnect and
+ * re-resolve their role, exactly like a per-doc permission change.
+ */
+function kickWorkspaceDocs(workspaceId: string): void {
+  void meta.list().then((docs) => {
+    for (const d of docs) {
+      if (d.workspaceId === workspaceId) kickDocConnections(d.docId);
+    }
+  });
+}
+
+/** Detach a workspace's docs then delete it, kicking their connections. */
+async function kickWorkspaceDocsAndDetach(workspaceId: string): Promise<void> {
+  const docs = (await meta.list()).filter((d) => d.workspaceId === workspaceId);
+  await meta.deleteWorkspace(workspaceId);
+  for (const d of docs) kickDocConnections(d.docId);
+}
 
 // --- Git-native flows (roadmap #3) --------------------------------------------
 //
