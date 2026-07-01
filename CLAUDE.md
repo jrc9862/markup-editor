@@ -123,6 +123,13 @@ reach every connected human (and the CLI daemon → disk) in realtime:
   `{message,paths?}` · `POST /api/git/branch` `{name,checkout?}` ·
   `POST /api/git/checkout` `{name}` — only when `MARKUP_REPO_DIR` is set (404
   otherwise); git args passed as arrays (no shell)
+- **SCIM 2.0 provisioning** (`/scim/v2/*`, Phase 3, see PHASE3_SCIM.md): a
+  separate router for an IdP (Okta/Azure AD) — *not* the agent surface. Its own
+  static bearer (`MARKUP_SCIM_TOKEN`; unset ⇒ the whole tree 404s, like the git
+  routes), outside the `/api` principal guard. `Users` map onto `users`,
+  `Groups` onto workspaces + members; deprovisioning is `active:false`, enforced
+  at `resolvePrincipal` (locks REST + WS, drops sessions) with the row kept for
+  attribution. Group changes reuse the per-workspace audit log (actor `SCIM`).
 
 Suggestion creation accepts an optional caller-supplied `id` (409 on
 duplicate) — this is how optimistic clients reconcile the server echo.
@@ -209,7 +216,9 @@ comments/suggestions; self-reported names are ignored. Web uses
 `http://localhost:3000`). Other env:
 `PORT`, `MARKUP_DATA_DIR`, `DATABASE_URL` (server — Postgres when set, SQLite
 otherwise), `MARKUP_REPO_DIR` (server — enables the git-native flow routes
-against that working tree; unset = those routes 404); `MARKUP_SERVER`,
+against that working tree; unset = those routes 404), `MARKUP_SCIM_TOKEN`
+(server — when set, mounts the SCIM 2.0 provisioning routes at `/scim/v2` and
+requires that static bearer; unset = those routes 404); `MARKUP_SERVER`,
 `MARKUP_WEB` (CLI); `NEXT_PUBLIC_MARKUP_SERVER`
 (web). Phase 2 observability/limits env (all optional, sane defaults):
 `LOG_LEVEL` (default `info`), `LOG_PRETTY` (`0` forces JSON outside
@@ -404,7 +413,11 @@ way), mono accents (CSS vars in `globals.css`).
    see PHASE3_AUDIT.md). Slice 4 surfaced the audit log in the web UI: an
    admin-only "Audit log" viewer inside each `WorkspacesPanel` card (paginated
    "Load more" + CSV export via `lib/workspaces.ts` `listAudit`/`fetchAuditCsv`).
-   Remaining: SAML/SCIM.
+   Slice 5 shipped SCIM 2.0 provisioning (`/scim/v2/*`, gated by
+   `MARKUP_SCIM_TOKEN`; server + REST; see PHASE3_SCIM.md) — Users→`users`,
+   Groups→workspaces, deprovision = `active:false` enforced at
+   `resolvePrincipal`. Remaining: SAML SSO, then retiring the legacy shared
+   `MARKUP_TOKEN`.
 2. **Enterprise Phase 2 (scale/ops)** — observability + self-protection
    limits shipped (structured logs, `/metrics`, `/readyz`, REST rate limiting,
    per-user WS caps, doc byte-size guard); plus history retention + backups

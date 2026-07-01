@@ -164,4 +164,15 @@ by an enterprise today.
      human-readable summaries, keyset "Load more" pagination, and a CSV export
      (blob download). New `listAudit`/`fetchAuditCsv` in `lib/workspaces.ts`;
      drives the slice-3 route unchanged. Web only.
-   - Remaining: SAML/SCIM.
+   - **Slice 5 — SCIM 2.0 provisioning (shipped; see PHASE3_SCIM.md).** An IdP
+     (Okta/Azure AD) provisions/deprovisions users + groups at `/scim/v2/*`
+     under a static bearer (`MARKUP_SCIM_TOKEN`; unset ⇒ routes 404). SCIM Users
+     map onto `users`, Groups onto workspaces + members — so it rides the Phase
+     3 membership model unchanged. Deprovisioning is `active:false`, enforced at
+     the single `resolvePrincipal` choke point (locks the user out of REST + WS,
+     drops their sessions); the row is kept for attribution. Additive schema
+     (`users.active`/`users.external_id`, `workspaces.external_id`); group
+     changes reuse the per-workspace audit log with actor `SCIM`. Server + REST
+     + tests.
+   - Remaining: SAML SSO (signed-assertion sign-in), then retiring the legacy
+     shared `MARKUP_TOKEN`.

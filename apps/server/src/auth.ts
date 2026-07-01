@@ -86,7 +86,7 @@ export async function resolvePrincipal(
     const session = await meta.getSession(sha256(sessionSecret));
     if (session && Date.parse(session.expiresAt) > Date.now()) {
       const user = await meta.getUser(session.userId);
-      if (user) return { kind: 'user', user, scope: 'write' };
+      if (user && user.active !== false) return { kind: 'user', user, scope: 'write' };
     }
   }
 
@@ -95,7 +95,7 @@ export async function resolvePrincipal(
       const token = await meta.getApiTokenByHash(sha256(opts.bearer));
       if (token) {
         const user = await meta.getUser(token.userId);
-        if (user) {
+        if (user && user.active !== false) {
           return { kind: 'agent', user, tokenName: token.name, scope: token.scope };
         }
       }
