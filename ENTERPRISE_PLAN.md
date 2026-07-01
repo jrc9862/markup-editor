@@ -159,4 +159,9 @@ by an enterprise today.
      export); cascade-deletes with its workspace. Content edits stay out of
      scope (covered by `doc_versions` + the event stream). Server + REST +
      tests; audit-log web UI rides with the admin console.
-   - Remaining: SAML/SCIM, admin console.
+   - **Slice 4 — admin console web UI (shipped).** An admin-only "Audit log"
+     viewer inside each `WorkspacesPanel` card: newest-first entries with
+     human-readable summaries, keyset "Load more" pagination, and a CSV export
+     (blob download). New `listAudit`/`fetchAuditCsv` in `lib/workspaces.ts`;
+     drives the slice-3 route unchanged. Web only.
+   - Remaining: SAML/SCIM.
