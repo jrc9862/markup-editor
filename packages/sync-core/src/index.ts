@@ -44,4 +44,7 @@ export type {
   Workspace,
   WorkspaceMember,
   WorkspaceWithRole,
+  AuditAction,
+  AuditTargetType,
+  AuditEntry,
 } from './types.js';

@@ -2,6 +2,7 @@ import Database from 'better-sqlite3';
 import type {
   AclEntry,
   ApiTokenMeta,
+  AuditEntry,
   AuthUser,
   DocMeta,
   DocRole,
@@ -164,6 +165,20 @@ export interface MetaStore {
   /** Move a doc into a workspace (or `null` to detach it). */
   setDocWorkspace(docId: string, workspaceId: string | null): Promise<void>;
 
+  // --- Audit log (Phase 3). Records workspace-administrative actions; rows
+  // are scoped to a workspace and cascade-deleted with it.
+  /** Append one audit entry; the store assigns `id` and returns it. */
+  appendAudit(entry: Omit<AuditEntry, 'id'>): Promise<AuditEntry>;
+  /**
+   * A workspace's audit entries, newest first. `before` is an id cursor
+   * (return only entries with a smaller id) for keyset pagination; `limit`
+   * defaults to 100.
+   */
+  listAudit(
+    workspaceId: string,
+    opts?: { limit?: number; before?: number },
+  ): Promise<AuditEntry[]>;
+
   /** Readiness probe: round-trips a trivial query, throws if unreachable. */
   ping(): Promise<void>;
   close(): Promise<void>;
@@ -208,6 +223,32 @@ function toWorkspace(row: WorkspaceRow): Workspace {
     slug: row.slug,
     defaultRole: row.default_role as DocRole,
     createdAt: row.created_at,
+  };
+}
+
+interface AuditRow {
+  id: number;
+  workspace_id: string;
+  ts: string;
+  actor_id: string | null;
+  actor_name: string | null;
+  action: string;
+  target_type: string;
+  target_id: string | null;
+  detail: string | null;
+}
+
+function toAudit(row: AuditRow): AuditEntry {
+  return {
+    id: row.id,
+    workspaceId: row.workspace_id,
+    ts: row.ts,
+    actorId: row.actor_id ?? undefined,
+    actorName: row.actor_name ?? undefined,
+    action: row.action as AuditEntry['action'],
+    targetType: row.target_type as AuditEntry['targetType'],
+    targetId: row.target_id ?? undefined,
+    detail: row.detail ? (JSON.parse(row.detail) as Record<string, unknown>) : undefined,
   };
 }
 
@@ -287,6 +328,18 @@ export class SqliteMetaStore implements MetaStore {
         created_at TEXT NOT NULL,
         PRIMARY KEY (workspace_id, user_id)
       );
+      CREATE TABLE IF NOT EXISTS audit_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        workspace_id TEXT NOT NULL,
+        ts TEXT NOT NULL,
+        actor_id TEXT,
+        actor_name TEXT,
+        action TEXT NOT NULL,
+        target_type TEXT NOT NULL,
+        target_id TEXT,
+        detail TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_audit_ws ON audit_log (workspace_id, id);
     `);
     // Migrations: older databases lack these doc_meta columns.
     const cols = this.db.prepare('PRAGMA table_info(doc_meta)').all() as Array<{
@@ -723,6 +776,7 @@ export class SqliteMetaStore implements MetaStore {
         .prepare('UPDATE doc_meta SET workspace_id = NULL WHERE workspace_id = ?')
         .run(wid);
       this.db.prepare('DELETE FROM workspace_members WHERE workspace_id = ?').run(wid);
+      this.db.prepare('DELETE FROM audit_log WHERE workspace_id = ?').run(wid);
       return this.db.prepare('DELETE FROM workspaces WHERE id = ?').run(wid);
     });
     return tx(id).changes > 0;
@@ -792,6 +846,49 @@ export class SqliteMetaStore implements MetaStore {
     this.db
       .prepare('UPDATE doc_meta SET workspace_id = ? WHERE doc_id = ?')
       .run(workspaceId, docId);
+  }
+
+  async appendAudit(entry: Omit<AuditEntry, 'id'>): Promise<AuditEntry> {
+    const info = this.db
+      .prepare(
+        `INSERT INTO audit_log
+           (workspace_id, ts, actor_id, actor_name, action, target_type, target_id, detail)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        entry.workspaceId,
+        entry.ts,
+        entry.actorId ?? null,
+        entry.actorName ?? null,
+        entry.action,
+        entry.targetType,
+        entry.targetId ?? null,
+        entry.detail ? JSON.stringify(entry.detail) : null,
+      );
+    return { ...entry, id: Number(info.lastInsertRowid) };
+  }
+
+  async listAudit(
+    workspaceId: string,
+    opts?: { limit?: number; before?: number },
+  ): Promise<AuditEntry[]> {
+    const limit = Math.min(Math.max(opts?.limit ?? 100, 1), 1000);
+    const rows = (
+      opts?.before !== undefined
+        ? this.db
+            .prepare(
+              `SELECT * FROM audit_log WHERE workspace_id = ? AND id < ?
+               ORDER BY id DESC LIMIT ?`,
+            )
+            .all(workspaceId, opts.before, limit)
+        : this.db
+            .prepare(
+              `SELECT * FROM audit_log WHERE workspace_id = ?
+               ORDER BY id DESC LIMIT ?`,
+            )
+            .all(workspaceId, limit)
+    ) as AuditRow[];
+    return rows.map(toAudit);
   }
 
   async ping(): Promise<void> {

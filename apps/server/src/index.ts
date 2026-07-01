@@ -29,6 +29,9 @@ import {
   snapshotSuggestions,
 } from '@markup/sync-core';
 import type {
+  AuditAction,
+  AuditEntry,
+  AuditTargetType,
   CreateDocRequest,
   DocMeta,
   DocRole,
@@ -564,6 +567,16 @@ app.patch('/api/docs/:docId', needs('write'), docAccess('write'), async (req, re
       }
     }
     await meta.setDocWorkspace(req.params.docId, target ?? null);
+    // Audit the move against each affected workspace: the doc leaving its old
+    // one (detach) and/or joining the new one (attach).
+    const from = doc.workspaceId ?? null;
+    const to = target ?? null;
+    if (from && from !== to) {
+      audit(from, p, 'doc.detach', 'doc', doc.docId, { name: doc.name, to });
+    }
+    if (to && to !== from) {
+      audit(to, p, 'doc.attach', 'doc', doc.docId, { name: doc.name, from });
+    }
   }
 
   if (fields.name !== undefined || fields.path !== undefined) {
@@ -1234,6 +1247,10 @@ app.post('/api/workspaces', needs('write'), async (req, res) => {
   }
   const ws = await meta.createWorkspace(uuidv4(), body.name.trim(), slug, defaultRole);
   await meta.addMember(ws.id, p.user.id, 'admin');
+  audit(ws.id, p, 'workspace.create', 'workspace', ws.id, {
+    name: ws.name,
+    defaultRole: ws.defaultRole,
+  });
   res.status(201).json({ ...ws, role: 'admin' });
 });
 
@@ -1265,6 +1282,14 @@ app.patch('/api/workspaces/:wsId', needs('write'), wsAccess('admin'), async (req
     return;
   }
   const updated = await meta.updateWorkspace(req.params.wsId, fields);
+  audit(
+    req.params.wsId,
+    res.locals.principal as Principal,
+    'workspace.update',
+    'workspace',
+    req.params.wsId,
+    fields,
+  );
   // A defaultRole change alters members' effective doc roles; re-resolve live.
   if (fields.defaultRole !== undefined) kickWorkspaceDocs(req.params.wsId);
   res.json(updated);
@@ -1306,6 +1331,14 @@ app.post(
       return;
     }
     await meta.addMember(req.params.wsId, user.id, role);
+    audit(
+      req.params.wsId,
+      res.locals.principal as Principal,
+      'member.add',
+      'member',
+      user.id,
+      { email: user.email, role },
+    );
     kickWorkspaceDocs(req.params.wsId);
     res.status(201).json({ userId: user.id, role });
   },
@@ -1334,6 +1367,14 @@ app.patch(
       }
     }
     await meta.addMember(req.params.wsId, req.params.userId, role);
+    audit(
+      req.params.wsId,
+      res.locals.principal as Principal,
+      'member.update',
+      'member',
+      req.params.userId,
+      { from: current, to: role },
+    );
     kickWorkspaceDocs(req.params.wsId);
     res.json({ userId: req.params.userId, role });
   },
@@ -1356,10 +1397,76 @@ app.delete(
       }
     }
     await meta.removeMember(req.params.wsId, req.params.userId);
+    audit(
+      req.params.wsId,
+      res.locals.principal as Principal,
+      'member.remove',
+      'member',
+      req.params.userId,
+      { role: current },
+    );
     kickWorkspaceDocs(req.params.wsId);
     res.json({ ok: true });
   },
 );
+
+/**
+ * Audit log for a workspace (admin only): the recorded administrative actions,
+ * newest first. Keyset-paginated with `?limit` (default 100, max 1000) and
+ * `?before=<id>`. `?format=csv` streams a downloadable export instead of JSON.
+ */
+app.get(
+  '/api/workspaces/:wsId/audit',
+  needs('read'),
+  wsAccess('admin'),
+  async (req, res) => {
+    const limit = Number.parseInt(String(req.query.limit ?? ''), 10);
+    const before = Number.parseInt(String(req.query.before ?? ''), 10);
+    const entries = await meta.listAudit(req.params.wsId, {
+      limit: Number.isNaN(limit) ? undefined : limit,
+      before: Number.isNaN(before) ? undefined : before,
+    });
+    if (req.query.format === 'csv') {
+      res
+        .type('text/csv')
+        .set(
+          'Content-Disposition',
+          `attachment; filename="audit-${req.params.wsId}.csv"`,
+        )
+        .send(auditToCsv(entries));
+      return;
+    }
+    res.json(entries);
+  },
+);
+
+/** Serialize audit entries to CSV (RFC-4180 quoting) for export/download. */
+function auditToCsv(entries: AuditEntry[]): string {
+  const cols = [
+    'id',
+    'ts',
+    'actorId',
+    'actorName',
+    'action',
+    'targetType',
+    'targetId',
+    'detail',
+  ] as const;
+  const cell = (v: unknown): string => {
+    const s =
+      v === undefined || v === null
+        ? ''
+        : typeof v === 'object'
+          ? JSON.stringify(v)
+          : String(v);
+    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const lines = [cols.join(',')];
+  for (const e of entries) {
+    lines.push(cols.map((c) => cell(e[c])).join(','));
+  }
+  return lines.join('\n');
+}
 
 /**
  * A workspace change (membership/defaultRole) shifts effective doc roles, so
@@ -1379,6 +1486,36 @@ async function kickWorkspaceDocsAndDetach(workspaceId: string): Promise<void> {
   const docs = (await meta.list()).filter((d) => d.workspaceId === workspaceId);
   await meta.deleteWorkspace(workspaceId);
   for (const d of docs) kickDocConnections(d.docId);
+}
+
+/**
+ * Record a workspace-administrative action in the audit log. Best-effort:
+ * a logging failure must never fail the action that triggered it, so errors
+ * are swallowed (and surfaced in the server log). The actor is taken from the
+ * principal — workspace routes always carry a real user (legacy is rejected).
+ */
+function audit(
+  workspaceId: string,
+  principal: Principal,
+  action: AuditAction,
+  targetType: AuditTargetType,
+  targetId?: string,
+  detail?: Record<string, unknown>,
+): void {
+  const actor = principal.kind === 'legacy' ? undefined : principal.user;
+  const entry: Omit<AuditEntry, 'id'> = {
+    workspaceId,
+    ts: new Date().toISOString(),
+    actorId: actor?.id,
+    actorName: actor?.name,
+    action,
+    targetType,
+    targetId,
+    detail,
+  };
+  void meta.appendAudit(entry).catch((err) => {
+    logger.error({ err, action, workspaceId }, 'audit append failed');
+  });
 }
 
 // --- Git-native flows (roadmap #3) --------------------------------------------
