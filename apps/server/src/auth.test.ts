@@ -93,6 +93,17 @@ describe('resolvePrincipal', () => {
     ).toBeNull();
   });
 
+  it('rejects the shared token when none is configured (retired by default)', async () => {
+    // With MARKUP_TOKEN unset, index.ts passes legacyToken: undefined, so the
+    // shared-token path is dead — even the old built-in default no longer works.
+    expect(
+      await resolvePrincipal(store, { bearer: 'dev-token' }),
+    ).toBeNull();
+    expect(
+      await resolvePrincipal(store, { bearer: LEGACY, legacyToken: undefined }),
+    ).toBeNull();
+  });
+
   it('prefers the session cookie over a bearer token', async () => {
     const { secret } = await startSession(store, 'u-1');
     const p = await resolvePrincipal(store, {
