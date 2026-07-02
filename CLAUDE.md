@@ -184,7 +184,12 @@ or zero-setup dev sign-in `POST /auth/dev` when no SSO is
 configured), `mkp_`-prefixed API tokens (per-user/per-agent, scoped
 read<comment<suggest<write, managed via `/api/tokens`, hashes only in DB —
 this is also CLI auth: set `MARKUP_TOKEN=mkp_...`), and the legacy shared
-`MARKUP_TOKEN` (default `dev-token`, full access unless `MARKUP_REQUIRE_AUTH=1`).
+`MARKUP_TOKEN` (full access, no identity — **deprecated and opt-in**: there is no
+built-in default anymore, so it works only when `MARKUP_TOKEN` is explicitly set,
+and never when `MARKUP_REQUIRE_AUTH=1`. A deployment that configures nothing is
+secure by default. The `dev:server` npm script sets `MARKUP_TOKEN=dev-token` so
+zero-setup local dev — and the `Bearer dev-token` curl smoke tests below — still
+work out of the box).
 Scope checks guard every REST route (`needs()` in `index.ts`). Per-doc roles
 (milestone 2): docs carry `owner_id` + `link_role` and a `doc_acl` table maps
 user→role (owner/editor/suggester/commenter/viewer; 'none' link role =
@@ -196,7 +201,8 @@ read-only (Hocuspocus drops their updates); suggester/commenter act through
 REST. Permission changes take effect live: the server closes the doc's WS
 connections (`closeConnections(docId)`), providers reconnect and re-resolve
 the role, and the web client refetches `myRole` on every `synced` event
-(revoked users land on an access-revoked screen). `MARKUP_REQUIRE_AUTH=1` disables the legacy shared token entirely.
+(revoked users land on an access-revoked screen). The legacy shared token is off
+unless `MARKUP_TOKEN` is set, and `MARKUP_REQUIRE_AUTH=1` disables it even then.
 Legacy principals and pre-identity (unowned) docs behave as before: full
 access, open collaboration. **Workspaces** (Phase 3, see PHASE3_WORKSPACES.md):
 a doc may belong to one workspace (`doc_meta.workspace_id`); `workspace_members`
@@ -427,8 +433,11 @@ way), mono accents (CSS vars in `globals.css`).
    `SAML_ENTRY_POINT`+`SAML_IDP_CERT`; server + web sign-in button; see
    PHASE3_SAML.md) — SP-initiated HTTP-POST binding via `@node-saml/node-saml`,
    the validated assertion JIT-provisions a `users` row by email and issues the
-   same session cookie OIDC does. Remaining: retiring the legacy shared
-   `MARKUP_TOKEN`.
+   same session cookie OIDC does. Finally, the legacy shared `MARKUP_TOKEN` was
+   retired as a default: it has no built-in value anymore, so it works only when
+   explicitly set (`dev:server` sets it for local dev) and a fresh deployment is
+   secure by default — closing out the Phase 1–3 identity arc. **Phase 3 (and
+   the identity roadmap) is complete.**
 2. **Enterprise Phase 2 (scale/ops)** — observability + self-protection
    limits shipped (structured logs, `/metrics`, `/readyz`, REST rate limiting,
    per-user WS caps, doc byte-size guard); plus history retention + backups
