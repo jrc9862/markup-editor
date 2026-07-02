@@ -177,8 +177,11 @@ agent surface can be smoke-tested with curl + `Authorization: Bearer dev-token`.
 
 Auth (Phase 1, see PHASE1_IDENTITY.md): three principal kinds — session
 cookie (signed-in human; OIDC via `OIDC_ISSUER`/`OIDC_CLIENT_ID`/
-`OIDC_CLIENT_SECRET`, or zero-setup dev sign-in `POST /auth/dev` when OIDC is
-unset), `mkp_`-prefixed API tokens (per-user/per-agent, scoped
+`OIDC_CLIENT_SECRET`, **SAML 2.0** via `SAML_ENTRY_POINT`/`SAML_IDP_CERT`
+(Phase 3, see PHASE3_SAML.md — SP-initiated POST binding at `/auth/saml/*`,
+JIT-provisions the `users` row by asserted email; unset ⇒ those routes 404),
+or zero-setup dev sign-in `POST /auth/dev` when no SSO is
+configured), `mkp_`-prefixed API tokens (per-user/per-agent, scoped
 read<comment<suggest<write, managed via `/api/tokens`, hashes only in DB —
 this is also CLI auth: set `MARKUP_TOKEN=mkp_...`), and the legacy shared
 `MARKUP_TOKEN` (default `dev-token`, full access unless `MARKUP_REQUIRE_AUTH=1`).
@@ -218,8 +221,12 @@ comments/suggestions; self-reported names are ignored. Web uses
 otherwise), `MARKUP_REPO_DIR` (server — enables the git-native flow routes
 against that working tree; unset = those routes 404), `MARKUP_SCIM_TOKEN`
 (server — when set, mounts the SCIM 2.0 provisioning routes at `/scim/v2` and
-requires that static bearer; unset = those routes 404); `MARKUP_SERVER`,
-`MARKUP_WEB` (CLI); `NEXT_PUBLIC_MARKUP_SERVER`
+requires that static bearer; unset = those routes 404); SAML SSO (server, all
+optional — `SAML_ENTRY_POINT` (IdP SSO URL) + `SAML_IDP_CERT` (IdP signing
+cert PEM; both required to enable, else `/auth/saml/*` 404) + `SAML_ISSUER`
+(SP entity ID, default `MARKUP_SERVER_ORIGIN`) + `SAML_CALLBACK_URL` (ACS URL,
+default `<origin>/auth/saml/callback`) + `SAML_AUDIENCE` + `SAML_IDENTIFIER_FORMAT`);
+`MARKUP_SERVER`, `MARKUP_WEB` (CLI); `NEXT_PUBLIC_MARKUP_SERVER`
 (web). Phase 2 observability/limits env (all optional, sane defaults):
 `LOG_LEVEL` (default `info`), `LOG_PRETTY` (`0` forces JSON outside
 production), `MARKUP_METRICS_TOKEN` (when set, `GET /metrics` requires that
@@ -416,7 +423,11 @@ way), mono accents (CSS vars in `globals.css`).
    Slice 5 shipped SCIM 2.0 provisioning (`/scim/v2/*`, gated by
    `MARKUP_SCIM_TOKEN`; server + REST; see PHASE3_SCIM.md) — Users→`users`,
    Groups→workspaces, deprovision = `active:false` enforced at
-   `resolvePrincipal`. Remaining: SAML SSO, then retiring the legacy shared
+   `resolvePrincipal`. Slice 6 shipped SAML 2.0 SSO (`/auth/saml/*`, gated by
+   `SAML_ENTRY_POINT`+`SAML_IDP_CERT`; server + web sign-in button; see
+   PHASE3_SAML.md) — SP-initiated HTTP-POST binding via `@node-saml/node-saml`,
+   the validated assertion JIT-provisions a `users` row by email and issues the
+   same session cookie OIDC does. Remaining: retiring the legacy shared
    `MARKUP_TOKEN`.
 2. **Enterprise Phase 2 (scale/ops)** — observability + self-protection
    limits shipped (structured logs, `/metrics`, `/readyz`, REST rate limiting,

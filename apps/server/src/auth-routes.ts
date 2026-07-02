@@ -1,4 +1,4 @@
-import type express from 'express';
+import express from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import {
   clearSessionCookie,
@@ -19,12 +19,19 @@ import {
   type OidcConfig,
   type OidcLoginState,
 } from './oidc.js';
+import {
+  createSaml,
+  identityFromProfile,
+  type SamlConfig,
+} from './saml.js';
+import type { SAML } from '@node-saml/node-saml';
 import type { MetaStore } from './db.js';
 
 const OIDC_STATE_COOKIE = 'markup_oidc';
 
 export interface AuthRouteOpts {
   oidc: OidcConfig | null;
+  saml: SamlConfig | null;
   /** Where to send the browser after sign-in (the web app origin). */
   webOrigin: string;
   secureCookies: boolean;
@@ -36,14 +43,26 @@ export function registerAuthRoutes(
   meta: MetaStore,
   opts: AuthRouteOpts,
 ): void {
+  // Built once on first use; a signed IdP config is static for the process.
+  let saml: SAML | null = null;
+  const getSaml = (): SAML => {
+    if (!saml) saml = createSaml(opts.saml!);
+    return saml;
+  };
+
   app.get('/auth/providers', (_req, res) => {
-    res.json({ oidc: Boolean(opts.oidc), dev: !opts.oidc });
+    res.json({
+      oidc: Boolean(opts.oidc),
+      saml: Boolean(opts.saml),
+      // Dev sign-in is the fallback only when no real IdP is configured.
+      dev: !opts.oidc && !opts.saml,
+    });
   });
 
-  // Dev sign-in: zero-setup local identity. Configuring OIDC disables it.
+  // Dev sign-in: zero-setup local identity. Configuring a real IdP disables it.
   app.post('/auth/dev', async (req, res) => {
-    if (opts.oidc) {
-      res.status(404).json({ error: 'dev sign-in is disabled (OIDC configured)' });
+    if (opts.oidc || opts.saml) {
+      res.status(404).json({ error: 'dev sign-in is disabled (SSO configured)' });
       return;
     }
     const { email, name } = req.body as { email?: string; name?: string };
@@ -100,6 +119,67 @@ export function registerAuthRoutes(
       res.status(401).json({ error: 'sign-in failed' });
     }
   });
+
+  // --- SAML 2.0 (SP-initiated, HTTP-POST binding) --------------------------
+
+  // SP metadata for configuring the IdP (entity ID, ACS URL, NameID format).
+  app.get('/auth/saml/metadata', (_req, res) => {
+    if (!opts.saml) {
+      res.status(404).json({ error: 'SAML is not configured' });
+      return;
+    }
+    res.type('application/xml');
+    res.send(getSaml().generateServiceProviderMetadata(null, null));
+  });
+
+  // Kick off login: redirect the browser to the IdP with a signed AuthnRequest.
+  app.get('/auth/saml/login', async (_req, res) => {
+    if (!opts.saml) {
+      res.status(404).json({ error: 'SAML is not configured' });
+      return;
+    }
+    try {
+      const url = await getSaml().getAuthorizeUrlAsync('', undefined, {});
+      res.redirect(url);
+    } catch (err) {
+      console.error('SAML login failed:', err);
+      res.status(500).json({ error: 'could not start SAML sign-in' });
+    }
+  });
+
+  // Assertion Consumer Service: the IdP POSTs the signed response here
+  // (application/x-www-form-urlencoded). Validate it, then issue a session.
+  app.post(
+    '/auth/saml/callback',
+    express.urlencoded({ extended: false, limit: '256kb' }),
+    async (req, res) => {
+      if (!opts.saml) {
+        res.status(404).json({ error: 'SAML is not configured' });
+        return;
+      }
+      try {
+        const { profile } = await getSaml().validatePostResponseAsync(
+          req.body as Record<string, string>,
+        );
+        if (!profile) throw new Error('no assertion in SAML response');
+        const identity = identityFromProfile(profile);
+        const user = await meta.upsertUser(
+          uuidv4(),
+          identity.email,
+          identity.name,
+        );
+        const { secret } = await startSession(meta, user.id);
+        res.setHeader(
+          'Set-Cookie',
+          sessionCookie(secret, { secure: opts.secureCookies }),
+        );
+        res.redirect(opts.webOrigin);
+      } catch (err) {
+        console.error('SAML callback failed:', err);
+        res.status(401).json({ error: 'sign-in failed' });
+      }
+    },
+  );
 
   app.post('/auth/logout', async (req, res) => {
     const secret = parseCookies(req.headers.cookie)[SESSION_COOKIE];
