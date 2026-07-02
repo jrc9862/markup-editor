@@ -122,7 +122,10 @@ reach every connected human (and the CLI daemon → disk) in realtime:
 - `GET /api/git/status` · `GET /api/git/branches` · `POST /api/git/commit`
   `{message,paths?}` · `POST /api/git/branch` `{name,checkout?}` ·
   `POST /api/git/checkout` `{name}` — only when `MARKUP_REPO_DIR` is set (404
-  otherwise); git args passed as arrays (no shell)
+  otherwise); git args passed as arrays (no shell). Mutations
+  (commit/branch/checkout) are additionally gated by `MARKUP_GIT_ADMINS`
+  (comma-separated user ids/emails); unset ⇒ open to any write-scoped
+  principal, with a startup warning
 - **SCIM 2.0 provisioning** (`/scim/v2/*`, Phase 3, see PHASE3_SCIM.md): a
   separate router for an IdP (Okta/Azure AD) — *not* the agent surface. Its own
   static bearer (`MARKUP_SCIM_TOKEN`; unset ⇒ the whole tree 404s, like the git
@@ -225,7 +228,10 @@ comments/suggestions; self-reported names are ignored. Web uses
 `http://localhost:3000`). Other env:
 `PORT`, `MARKUP_DATA_DIR`, `DATABASE_URL` (server — Postgres when set, SQLite
 otherwise), `MARKUP_REPO_DIR` (server — enables the git-native flow routes
-against that working tree; unset = those routes 404), `MARKUP_SCIM_TOKEN`
+against that working tree; unset = those routes 404), `MARKUP_GIT_ADMINS`
+(server — comma-separated user ids/emails allowed to run git *mutations*
+(commit/branch/checkout); unset = any write-scoped principal may, with a
+startup warning), `MARKUP_SCIM_TOKEN`
 (server — when set, mounts the SCIM 2.0 provisioning routes at `/scim/v2` and
 requires that static bearer; unset = those routes 404); SAML SSO (server, all
 optional — `SAML_ENTRY_POINT` (IdP SSO URL) + `SAML_IDP_CERT` (IdP signing
