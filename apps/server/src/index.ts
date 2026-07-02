@@ -78,12 +78,16 @@ import { connections } from './connections.js';
 import { exceedsByteLimit, applyRangeEditsToString } from './limits.js';
 
 const PORT = Number(process.env.PORT ?? 4000);
-const TOKEN = process.env.MARKUP_TOKEN ?? 'dev-token';
+// The legacy shared token is deprecated and now opt-in: it works only when
+// MARKUP_TOKEN is explicitly set (there is no built-in default anymore), so a
+// deployment that configures nothing is secure by default — every request must
+// be a session cookie or an `mkp_` API token. Local dev opts in via the
+// `dev:server` npm script, which sets MARKUP_TOKEN=dev-token. MARKUP_REQUIRE_AUTH=1
+// is the hard kill switch that disables it even when a value is set.
+const TOKEN = process.env.MARKUP_TOKEN || undefined;
 const DATA_DIR = process.env.MARKUP_DATA_DIR ?? '.';
 const DATABASE_URL = process.env.DATABASE_URL;
 const WEB_ORIGIN = process.env.MARKUP_WEB_ORIGIN ?? 'http://localhost:3000';
-// When set, the legacy shared token stops working: every request must be a
-// session or an API token. The end state for enterprise deployments.
 const REQUIRE_AUTH = process.env.MARKUP_REQUIRE_AUTH === '1';
 const LEGACY_TOKEN = REQUIRE_AUTH ? undefined : TOKEN;
 const SERVER_ORIGIN =
@@ -1688,6 +1692,13 @@ const httpServer = app.listen(PORT, () => {
     },
     'markup server listening',
   );
+  if (LEGACY_TOKEN) {
+    logger.warn(
+      'legacy shared MARKUP_TOKEN is active (full access, no identity) — ' +
+        'deprecated. Use `mkp_` API tokens or SSO; unset MARKUP_TOKEN (or set ' +
+        'MARKUP_REQUIRE_AUTH=1) to disable it.',
+    );
+  }
 });
 
 // One-shot retention sweep at startup so the age cap reaches docs that are no
