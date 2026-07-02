@@ -30,9 +30,13 @@ export function useMe(): { me: MeResponse | null; refresh: () => void } {
   return { me, refresh };
 }
 
-export async function fetchProviders(): Promise<{ oidc: boolean; dev: boolean }> {
+export async function fetchProviders(): Promise<{
+  oidc: boolean;
+  saml: boolean;
+  dev: boolean;
+}> {
   const r = await fetch(`${SERVER_HTTP}/auth/providers`);
-  return (await r.json()) as { oidc: boolean; dev: boolean };
+  return (await r.json()) as { oidc: boolean; saml: boolean; dev: boolean };
 }
 
 export async function devSignIn(email: string, name: string): Promise<boolean> {

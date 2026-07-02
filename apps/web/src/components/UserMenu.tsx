@@ -16,6 +16,10 @@ export default function UserMenu() {
       window.location.href = `${SERVER_HTTP}/auth/oidc/login`;
       return;
     }
+    if (providers.saml) {
+      window.location.href = `${SERVER_HTTP}/auth/saml/login`;
+      return;
+    }
     const email = window.prompt('Email');
     if (!email) return;
     const name = window.prompt('Display name', email.split('@')[0]);
