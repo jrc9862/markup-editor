@@ -39,8 +39,8 @@ export const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 /**
  * Who a request is acting as.
- * - user: a signed-in human (session cookie) — full scope until per-doc
- *   roles land (milestone 2).
+ * - user: a signed-in human (session cookie) — full token scope; the per-doc
+ *   role (ACL/workspace/link) still caps the effective capability.
  * - agent: an API token (per-user CLI token or per-agent automation token).
  * - legacy: the shared MARKUP_TOKEN; no identity. Deprecated.
  */
@@ -198,6 +198,21 @@ export async function effectiveScope(
   return SCOPES.indexOf(principal.scope) < SCOPES.indexOf(rs)
     ? principal.scope
     : rs;
+}
+
+/**
+ * May this principal update/withdraw an open suggestion? Write capability on
+ * the doc (the *effective* scope — weaker of token scope and doc role, not the
+ * bare token scope) may touch any; otherwise only the suggestion's author.
+ */
+export function canTouchSuggestion(
+  principal: Principal,
+  effective: TokenScope | null,
+  s: { authorId?: string },
+): boolean {
+  if (principal.kind === 'legacy') return true;
+  if (effective !== null && scopeAllows(effective, 'write')) return true;
+  return s.authorId === principal.user.id;
 }
 
 /** Create a session for a user; returns the plaintext secret for the cookie. */

@@ -1,6 +1,12 @@
 import { describe, it, expect } from 'vitest';
 import * as Y from 'yjs';
-import { applyEdits, findReplaceEdits, type RangeEdit } from './edits.js';
+import {
+  applyEdits,
+  findReplaceEdits,
+  MAX_FIND_LENGTH,
+  MAX_FIND_MATCHES,
+  type RangeEdit,
+} from './edits.js';
 
 function ytextOf(s: string): Y.Text {
   const doc = new Y.Doc();
@@ -79,5 +85,23 @@ describe('findReplaceEdits', () => {
       }),
     );
     expect(t.toString()).toBe('19/06/2026');
+  });
+
+  it('rejects an over-long find pattern', () => {
+    const long = 'a'.repeat(MAX_FIND_LENGTH + 1);
+    expect(() => findReplaceEdits('abc', long, 'x')).toThrow(/too long/);
+    expect(() => findReplaceEdits('abc', long, 'x', { regex: true })).toThrow(
+      /too long/,
+    );
+  });
+
+  it('caps the number of matches collected', () => {
+    const content = 'a'.repeat(MAX_FIND_MATCHES + 1);
+    expect(() => findReplaceEdits(content, 'a', 'b')).toThrow(
+      /too many matches/,
+    );
+    expect(() =>
+      findReplaceEdits(content, 'a', 'b', { regex: true }),
+    ).toThrow(/too many matches/);
   });
 });

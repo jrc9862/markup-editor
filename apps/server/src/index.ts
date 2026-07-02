@@ -1,3 +1,4 @@
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { Server as Hocuspocus } from '@hocuspocus/server';
 import { SQLite } from '@hocuspocus/extension-sqlite';
 import { Database as DatabaseExtension } from '@hocuspocus/extension-database';
@@ -45,6 +46,7 @@ import {
   type RetentionPolicy,
 } from './db.js';
 import {
+  canTouchSuggestion,
   effectiveScope,
   isRole,
   resolvePrincipal,
@@ -123,6 +125,16 @@ const SAML = samlFromEnv(SERVER_ORIGIN);
 // Git-native flows are enabled only when the server can reach a working tree
 // (MARKUP_REPO_DIR) — the self-hosted/local shape. Otherwise the routes 404.
 const git = GitBridge.fromEnv();
+// Who may run git *mutations* (commit/branch/checkout): a comma-separated
+// allowlist of user ids and/or emails. Unset preserves the open behavior
+// (any write-scoped principal) with a startup warning — reads stay open to
+// read scope either way.
+const GIT_ADMINS = new Set(
+  (process.env.MARKUP_GIT_ADMINS ?? '')
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean),
+);
 
 // --- Data layer: Postgres when DATABASE_URL is set, SQLite otherwise --------
 //
@@ -293,16 +305,39 @@ app.use((req, res, next) => {
 app.use(cors({ origin: WEB_ORIGIN, credentials: true }));
 app.use(express.json({ limit: '10mb' }));
 
+// Express 4 does not catch async handler rejections — an unhandled one leaves
+// the request hanging forever. `h` funnels rejections into the terminal error
+// middleware (registered after all routes), and the `api` facade applies it to
+// every handler at registration so no route can be forgotten.
+const h =
+  (fn: express.RequestHandler): express.RequestHandler =>
+  (req, res, next) => {
+    Promise.resolve(fn(req, res, next)).catch(next);
+  };
+
+const api = {
+  get: (path: string, ...handlers: express.RequestHandler[]) =>
+    app.get(path, ...handlers.map(h)),
+  post: (path: string, ...handlers: express.RequestHandler[]) =>
+    app.post(path, ...handlers.map(h)),
+  put: (path: string, ...handlers: express.RequestHandler[]) =>
+    app.put(path, ...handlers.map(h)),
+  patch: (path: string, ...handlers: express.RequestHandler[]) =>
+    app.patch(path, ...handlers.map(h)),
+  delete: (path: string, ...handlers: express.RequestHandler[]) =>
+    app.delete(path, ...handlers.map(h)),
+};
+
 // Liveness: the process is up and serving. Used by container orchestration to
 // decide whether to restart the pod.
-app.get('/healthz', (_req, res) => {
+api.get('/healthz', (_req, res) => {
   res.json({ ok: true });
 });
 
 // Readiness: the process can serve traffic right now. Fails during shutdown
 // (so the LB drains us before connections close) and if the store is
 // unreachable. Used by the LB to decide whether to route requests.
-app.get('/readyz', async (_req, res) => {
+api.get('/readyz', async (_req, res) => {
   if (shuttingDown) {
     res.status(503).json({ ready: false, reason: 'shutting down' });
     return;
@@ -319,10 +354,19 @@ app.get('/readyz', async (_req, res) => {
 // Prometheus scrape target. Outside /api (no per-doc auth); optionally gated
 // by a bearer when MARKUP_METRICS_TOKEN is set, otherwise restrict at the
 // network layer as usual for an internal endpoint.
-app.get('/metrics', async (req, res) => {
-  if (METRICS_TOKEN && req.headers.authorization !== `Bearer ${METRICS_TOKEN}`) {
-    res.status(401).end();
-    return;
+const METRICS_TOKEN_HASH = METRICS_TOKEN
+  ? createHash('sha256').update(METRICS_TOKEN).digest()
+  : undefined;
+api.get('/metrics', async (req, res) => {
+  if (METRICS_TOKEN_HASH) {
+    // Constant-time compare (via digests, which also equalizes lengths).
+    const header = req.headers.authorization ?? '';
+    const presented = header.startsWith('Bearer ') ? header.slice(7) : '';
+    const presentedHash = createHash('sha256').update(presented).digest();
+    if (!presented || !timingSafeEqual(presentedHash, METRICS_TOKEN_HASH)) {
+      res.status(401).end();
+      return;
+    }
   }
   res.type(registry.contentType).send(await registry.metrics());
 });
@@ -367,21 +411,24 @@ if (SCIM_TOKEN) {
 }
 
 /** Auth guard for all /api routes: resolves the acting principal. */
-app.use('/api', async (req, res, next) => {
-  const header = req.headers.authorization ?? '';
-  const bearer = header.startsWith('Bearer ') ? header.slice(7) : undefined;
-  const principal = await resolvePrincipal(meta, {
-    bearer,
-    cookieHeader: req.headers.cookie,
-    legacyToken: LEGACY_TOKEN,
-  });
-  if (!principal) {
-    res.status(401).json({ error: 'invalid token' });
-    return;
-  }
-  res.locals.principal = principal;
-  next();
-});
+app.use(
+  '/api',
+  h(async (req, res, next) => {
+    const header = req.headers.authorization ?? '';
+    const bearer = header.startsWith('Bearer ') ? header.slice(7) : undefined;
+    const principal = await resolvePrincipal(meta, {
+      bearer,
+      cookieHeader: req.headers.cookie,
+      legacyToken: LEGACY_TOKEN,
+    });
+    if (!principal) {
+      res.status(401).json({ error: 'invalid token' });
+      return;
+    }
+    res.locals.principal = principal;
+    next();
+  }),
+);
 
 // Applied after the guard so the limiter can key by resolved principal.
 app.use('/api', apiLimiter);
@@ -450,9 +497,8 @@ function publishMentions(
  * effective capability (weaker of token scope and doc role) covers `scope`.
  * Stashes the doc meta in res.locals for the handler.
  */
-const docAccess =
-  (scope: TokenScope): express.RequestHandler =>
-  async (req, res, next) => {
+const docAccess = (scope: TokenScope): express.RequestHandler =>
+  h(async (req, res, next) => {
     const doc = await meta.get(req.params.docId);
     if (!doc) {
       res.status(404).json({ error: 'not found' });
@@ -466,12 +512,12 @@ const docAccess =
     }
     res.locals.docMeta = doc;
     next();
-  };
+  });
 
 registerTokenRoutes(app, meta);
 
 /** Create a document, optionally seeding it with initial markdown. */
-app.post('/api/docs', needs('write'), async (req, res) => {
+api.post('/api/docs', needs('write'), async (req, res) => {
   const body = req.body as CreateDocRequest;
   if (!body?.name) {
     res.status(400).json({ error: 'name is required' });
@@ -504,7 +550,7 @@ app.post('/api/docs', needs('write'), async (req, res) => {
   res.status(201).json(docMeta);
 });
 
-app.get('/api/docs', needs('read'), async (_req, res) => {
+api.get('/api/docs', needs('read'), async (_req, res) => {
   const p = res.locals.principal as Principal;
   const all = await meta.list();
   const visible: typeof all = [];
@@ -514,7 +560,7 @@ app.get('/api/docs', needs('read'), async (_req, res) => {
   res.json(visible);
 });
 
-app.get('/api/docs/:docId', needs('read'), docAccess('read'), async (_req, res) => {
+api.get('/api/docs/:docId', needs('read'), docAccess('read'), async (_req, res) => {
   const docMeta = res.locals.docMeta as DocMeta;
   const p = res.locals.principal as Principal;
   res.json({ ...docMeta, myRole: await roleFor(meta, p, docMeta) });
@@ -537,7 +583,7 @@ function cleanRelPath(p: string): string | null {
  * above (write capability) may rename; the new path mirrors the file's
  * location on disk so the directory-tree browser stays in sync.
  */
-app.patch('/api/docs/:docId', needs('write'), docAccess('write'), async (req, res) => {
+api.patch('/api/docs/:docId', needs('write'), docAccess('write'), async (req, res) => {
   const body = req.body as { name?: string; path?: string };
   const fields: { name?: string; path?: string } = {};
   if (body.name !== undefined) {
@@ -621,7 +667,7 @@ app.patch('/api/docs/:docId', needs('write'), docAccess('write'), async (req, re
 });
 
 /** Snapshot: the document's current markdown as plain text. */
-app.get('/api/docs/:docId/snapshot', needs('read'), docAccess('read'), async (req, res) => {
+api.get('/api/docs/:docId/snapshot', needs('read'), docAccess('read'), async (req, res) => {
   const conn = await hocuspocus.openDirectConnection(req.params.docId);
   let content = '';
   await conn.transact((doc) => {
@@ -663,11 +709,11 @@ function resolveRange(
   content: string,
   body: RangeBody,
 ): { from: number; to: number } | null {
-  if (typeof body.from === 'number' && typeof body.to === 'number') {
-    if (body.from < 0 || body.to > content.length || body.to < body.from) {
+  if (Number.isInteger(body.from) && Number.isInteger(body.to)) {
+    if (body.from! < 0 || body.to! > content.length || body.to! < body.from!) {
       return null;
     }
-    return { from: body.from, to: body.to };
+    return { from: body.from!, to: body.to! };
   }
   if (body.anchorText) {
     let idx = -1;
@@ -685,7 +731,7 @@ const tooLarge = (content: string): boolean =>
   exceedsByteLimit(content, MAX_DOC_BYTES);
 
 /** Direct write: reconcile the whole document to the provided markdown. */
-app.put('/api/docs/:docId/content', needs('write'), docAccess('write'), async (req, res) => {
+api.put('/api/docs/:docId/content', needs('write'), docAccess('write'), async (req, res) => {
   const { content } = req.body as { content?: string };
   if (typeof content !== 'string') {
     res.status(400).json({ error: 'content (string) is required' });
@@ -711,7 +757,7 @@ app.put('/api/docs/:docId/content', needs('write'), docAccess('write'), async (r
  *   { find, replace, regex?, caseSensitive? }   — find/replace across the doc
  *   { edits: [{ from, to, insert }, ...] }       — explicit ranges
  */
-app.post('/api/docs/:docId/edits', needs('write'), docAccess('write'), async (req, res) => {
+api.post('/api/docs/:docId/edits', needs('write'), docAccess('write'), async (req, res) => {
   const body = req.body as {
     find?: string;
     replace?: string;
@@ -728,24 +774,26 @@ app.post('/api/docs/:docId/edits', needs('write'), docAccess('write'), async (re
   if (hasEdits) {
     for (const e of body.edits!) {
       if (
-        typeof e?.from !== 'number' ||
-        typeof e?.to !== 'number' ||
+        !Number.isInteger(e?.from) ||
+        !Number.isInteger(e?.to) ||
         typeof e?.insert !== 'string'
       ) {
-        res.status(400).json({ error: 'each edit needs from, to, insert' });
+        res.status(400).json({ error: 'each edit needs integer from, to and insert' });
         return;
       }
     }
   }
   const result = await withDoc(req.params.docId, (doc) => {
     const ytext = doc.getText(CONTENT_FIELD);
-    const edits = hasEdits
-      ? body.edits!
-      : findReplaceEdits(ytext.toString(), body.find!, body.replace ?? '', {
-          regex: body.regex,
-          caseSensitive: body.caseSensitive,
-        });
     try {
+      // findReplaceEdits inside the try: a bad `find` (invalid regex,
+      // over-long pattern, too many matches) must 400, never hang or 500.
+      const edits = hasEdits
+        ? body.edits!
+        : findReplaceEdits(ytext.toString(), body.find!, body.replace ?? '', {
+            regex: body.regex,
+            caseSensitive: body.caseSensitive,
+          });
       if (tooLarge(applyRangeEditsToString(ytext.toString(), edits))) {
         return { error: 'document too large', tooLarge: true };
       }
@@ -763,11 +811,11 @@ app.post('/api/docs/:docId/edits', needs('write'), docAccess('write'), async (re
   res.json(result);
 });
 
-app.get('/api/docs/:docId/comments', needs('read'), docAccess('read'), async (req, res) => {
+api.get('/api/docs/:docId/comments', needs('read'), docAccess('read'), async (req, res) => {
   res.json(await withDoc(req.params.docId, (doc) => snapshotComments(doc)));
 });
 
-app.post('/api/docs/:docId/comments', needs('comment'), docAccess('comment'), async (req, res) => {
+api.post('/api/docs/:docId/comments', needs('comment'), docAccess('comment'), async (req, res) => {
   const body = req.body as RangeBody & { author?: string; text?: string };
   const who = authorOf(res, body.author);
   if (!who || !body.text) {
@@ -789,7 +837,7 @@ app.post('/api/docs/:docId/comments', needs('comment'), docAccess('comment'), as
   res.status(201).json({ id: result });
 });
 
-app.post(
+api.post(
   '/api/docs/:docId/comments/:threadId/replies',
   needs('comment'),
   docAccess('comment'),
@@ -814,7 +862,7 @@ app.post(
   },
 );
 
-app.post(
+api.post(
   '/api/docs/:docId/comments/:threadId/resolve',
   needs('comment'),
   docAccess('comment'),
@@ -831,7 +879,7 @@ app.post(
   },
 );
 
-app.get('/api/docs/:docId/suggestions', needs('read'), docAccess('read'), async (req, res) => {
+api.get('/api/docs/:docId/suggestions', needs('read'), docAccess('read'), async (req, res) => {
   res.json(await withDoc(req.params.docId, (doc) => snapshotSuggestions(doc)));
 });
 
@@ -841,24 +889,35 @@ app.get('/api/docs/:docId/suggestions', needs('read'), docAccess('read'), async 
  * reviews, mentions, and edits as they happen. Requires read access; a
  * heartbeat comment keeps proxies from closing an idle stream.
  */
-app.get('/api/docs/:docId/events', needs('read'), docAccess('read'), (req, res) => {
+// Open SSE streams per doc, so a permission change can tear them down (see
+// kickDocConnections) — an SSE response otherwise outlives its access check
+// for as long as the client keeps it open.
+const sseClients = new Map<string, Set<express.Response>>();
+
+api.get('/api/docs/:docId/events', needs('read'), docAccess('read'), (req, res) => {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
     Connection: 'keep-alive',
   });
   res.write(': connected\n\n');
-  const unsubscribe = docEvents.subscribe(req.params.docId, (e) => {
+  const docId = req.params.docId;
+  let clients = sseClients.get(docId);
+  if (!clients) sseClients.set(docId, (clients = new Set()));
+  clients.add(res);
+  const unsubscribe = docEvents.subscribe(docId, (e) => {
     res.write(`event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`);
   });
   const heartbeat = setInterval(() => res.write(': ping\n\n'), 25_000);
   req.on('close', () => {
     clearInterval(heartbeat);
     unsubscribe();
+    clients!.delete(res);
+    if (clients!.size === 0) sseClients.delete(docId);
   });
 });
 
-app.post('/api/docs/:docId/suggestions', needs('suggest'), docAccess('suggest'), async (req, res) => {
+api.post('/api/docs/:docId/suggestions', needs('suggest'), docAccess('suggest'), async (req, res) => {
   const body = req.body as RangeBody & {
     id?: string;
     author?: string;
@@ -903,41 +962,38 @@ app.post('/api/docs/:docId/suggestions', needs('suggest'), docAccess('suggest'),
 
 /**
  * A suggestion's author may update or withdraw it while open (this powers
- * realtime suggesting for the suggester role); write capability may touch
- * any suggestion.
+ * realtime suggesting for the suggester role); *effective* write capability
+ * on the doc — the weaker of token scope and doc role, so a suggester-role
+ * user does not qualify — may touch any suggestion (see auth.ts
+ * canTouchSuggestion).
  */
-const canTouchSuggestion = (
+async function effectiveDocScope(
   res: express.Response,
-  s: { authorId?: string },
-): boolean => {
+): Promise<TokenScope | null> {
   const p = res.locals.principal as Principal;
-  if (p.kind === 'legacy') return true;
-  if (scopeAllows(p.scope, 'write')) {
-    // Token allows writes, but the doc role must too — docAccess('suggest')
-    // already ran, so check the role here via stashed meta.
-    return true;
-  }
-  return s.authorId === p.user.id;
-};
+  return effectiveScope(meta, p, res.locals.docMeta as DocMeta);
+}
 
-app.put(
+api.put(
   '/api/docs/:docId/suggestions/:sid',
   needs('suggest'),
   docAccess('suggest'),
   async (req, res) => {
     const body = req.body as { from?: number; to?: number; proposed?: string };
     if (
-      typeof body.from !== 'number' ||
-      typeof body.to !== 'number' ||
+      !Number.isInteger(body.from) ||
+      !Number.isInteger(body.to) ||
       typeof body.proposed !== 'string'
     ) {
-      res.status(400).json({ error: 'from, to and proposed are required' });
+      res.status(400).json({ error: 'integer from, to and proposed are required' });
       return;
     }
+    const p = res.locals.principal as Principal;
+    const eff = await effectiveDocScope(res);
     const result = await withDoc(req.params.docId, (doc) => {
       const existing = getSuggestion(doc, req.params.sid);
       if (!existing || existing.status !== 'open') return 'missing' as const;
-      if (!canTouchSuggestion(res, existing)) return 'forbidden' as const;
+      if (!canTouchSuggestion(p, eff, existing)) return 'forbidden' as const;
       const ytext = doc.getText(CONTENT_FIELD);
       const max = ytext.length;
       if (body.from! < 0 || body.to! > max || body.to! < body.from!) {
@@ -970,15 +1026,17 @@ app.put(
   },
 );
 
-app.delete(
+api.delete(
   '/api/docs/:docId/suggestions/:sid',
   needs('suggest'),
   docAccess('suggest'),
   async (req, res) => {
+    const p = res.locals.principal as Principal;
+    const eff = await effectiveDocScope(res);
     const result = await withDoc(req.params.docId, (doc) => {
       const existing = getSuggestion(doc, req.params.sid);
       if (!existing || existing.status !== 'open') return 'missing' as const;
-      if (!canTouchSuggestion(res, existing)) return 'forbidden' as const;
+      if (!canTouchSuggestion(p, eff, existing)) return 'forbidden' as const;
       removeSuggestion(doc, req.params.sid);
       return 'ok' as const;
     });
@@ -995,7 +1053,7 @@ app.delete(
 );
 
 /** Review discussion on a suggestion (like commenting on a PR diff). */
-app.post(
+api.post(
   '/api/docs/:docId/suggestions/:sid/replies',
   needs('comment'),
   docAccess('comment'),
@@ -1024,7 +1082,7 @@ app.post(
   },
 );
 
-app.post(
+api.post(
   '/api/docs/:docId/suggestions/:sid/accept',
   needs('write'),
   docAccess('write'),
@@ -1040,7 +1098,7 @@ app.post(
   },
 );
 
-app.post(
+api.post(
   '/api/docs/:docId/suggestions/:sid/reject',
   needs('write'),
   docAccess('write'),
@@ -1061,7 +1119,7 @@ app.post(
  * suggestions in ONE transaction — the reviewer dispositions a whole batch at
  * once, applied atomically and propagated like a single edit.
  */
-app.post(
+api.post(
   '/api/docs/:docId/suggestions/review',
   needs('write'),
   docAccess('write'),
@@ -1102,7 +1160,7 @@ app.post(
 
 // --- Sharing / permissions (owner only) ---------------------------------------
 
-const ownerOnly: express.RequestHandler = async (req, res, next) => {
+const ownerOnly: express.RequestHandler = h(async (req, res, next) => {
   const doc = await meta.get(req.params.docId);
   if (!doc) {
     res.status(404).json({ error: 'not found' });
@@ -1115,7 +1173,7 @@ const ownerOnly: express.RequestHandler = async (req, res, next) => {
   }
   res.locals.docMeta = doc;
   next();
-};
+});
 
 /**
  * After a permission change, close the doc's live connections: providers
@@ -1124,9 +1182,17 @@ const ownerOnly: express.RequestHandler = async (req, res, next) => {
  */
 function kickDocConnections(docId: string): void {
   hocuspocus.closeConnections(docId);
+  // Also end the doc's open SSE streams: subscribers reconnect and re-pass
+  // docAccess('read'), so a revoked principal's stream closes for good —
+  // matching the WS revocation guarantee.
+  const streams = sseClients.get(docId);
+  if (streams) {
+    sseClients.delete(docId);
+    for (const res of streams) res.end();
+  }
 }
 
-app.get('/api/docs/:docId/permissions', ownerOnly, async (req, res) => {
+api.get('/api/docs/:docId/permissions', ownerOnly, async (req, res) => {
   const doc = res.locals.docMeta as DocMeta;
   res.json({
     ownerId: doc.ownerId,
@@ -1137,7 +1203,7 @@ app.get('/api/docs/:docId/permissions', ownerOnly, async (req, res) => {
 });
 
 /** Grant a role to a user by email or id. */
-app.post('/api/docs/:docId/permissions', ownerOnly, async (req, res) => {
+api.post('/api/docs/:docId/permissions', ownerOnly, async (req, res) => {
   const body = req.body as { email?: string; userId?: string; role?: string };
   if (!isRole(body.role)) {
     res.status(400).json({
@@ -1159,7 +1225,7 @@ app.post('/api/docs/:docId/permissions', ownerOnly, async (req, res) => {
   res.json({ userId: user.id, role: body.role });
 });
 
-app.delete(
+api.delete(
   '/api/docs/:docId/permissions/:userId',
   ownerOnly,
   async (req, res) => {
@@ -1174,7 +1240,7 @@ app.delete(
 );
 
 /** Set the role granted by the share link ('none' makes the doc private). */
-app.put('/api/docs/:docId/permissions/link', ownerOnly, async (req, res) => {
+api.put('/api/docs/:docId/permissions/link', ownerOnly, async (req, res) => {
   const role = (req.body as { role?: string }).role;
   if (role !== 'none' && !isRole(role)) {
     res.status(400).json({
@@ -1209,9 +1275,8 @@ function slugify(s: string): string {
 }
 
 /** Gate on workspace membership: 404 if missing, 403 below the required level. */
-const wsAccess =
-  (level: WorkspaceRole): express.RequestHandler =>
-  async (req, res, next) => {
+const wsAccess = (level: WorkspaceRole): express.RequestHandler =>
+  h(async (req, res, next) => {
     const ws = await meta.getWorkspace(req.params.wsId);
     if (!ws) {
       res.status(404).json({ error: 'not found' });
@@ -1230,10 +1295,10 @@ const wsAccess =
     res.locals.workspace = ws;
     res.locals.wsRole = role;
     next();
-  };
+  });
 
 /** Workspaces the caller belongs to (empty for the identity-less legacy token). */
-app.get('/api/workspaces', needs('read'), async (_req, res) => {
+api.get('/api/workspaces', needs('read'), async (_req, res) => {
   const p = res.locals.principal as Principal;
   if (p.kind === 'legacy') {
     res.json([]);
@@ -1243,7 +1308,7 @@ app.get('/api/workspaces', needs('read'), async (_req, res) => {
 });
 
 /** Create a workspace; the creator becomes its first admin. */
-app.post('/api/workspaces', needs('write'), async (req, res) => {
+api.post('/api/workspaces', needs('write'), async (req, res) => {
   const p = res.locals.principal as Principal;
   if (p.kind === 'legacy') {
     res.status(403).json({ error: 'workspace requires a signed-in identity' });
@@ -1279,11 +1344,11 @@ app.post('/api/workspaces', needs('write'), async (req, res) => {
   res.status(201).json({ ...ws, role: 'admin' });
 });
 
-app.get('/api/workspaces/:wsId', needs('read'), wsAccess('member'), (_req, res) => {
+api.get('/api/workspaces/:wsId', needs('read'), wsAccess('member'), (_req, res) => {
   res.json({ ...(res.locals.workspace as Workspace), role: res.locals.wsRole });
 });
 
-app.patch('/api/workspaces/:wsId', needs('write'), wsAccess('admin'), async (req, res) => {
+api.patch('/api/workspaces/:wsId', needs('write'), wsAccess('admin'), async (req, res) => {
   const body = req.body as { name?: string; defaultRole?: string };
   const fields: { name?: string; defaultRole?: DocRole } = {};
   if (body.name !== undefined) {
@@ -1320,12 +1385,12 @@ app.patch('/api/workspaces/:wsId', needs('write'), wsAccess('admin'), async (req
   res.json(updated);
 });
 
-app.delete('/api/workspaces/:wsId', needs('write'), wsAccess('admin'), async (req, res) => {
+api.delete('/api/workspaces/:wsId', needs('write'), wsAccess('admin'), async (req, res) => {
   await kickWorkspaceDocsAndDetach(req.params.wsId);
   res.json({ ok: true });
 });
 
-app.get(
+api.get(
   '/api/workspaces/:wsId/members',
   needs('read'),
   wsAccess('member'),
@@ -1335,7 +1400,7 @@ app.get(
 );
 
 /** Add a member by email or id (existing user), defaulting to plain member. */
-app.post(
+api.post(
   '/api/workspaces/:wsId/members',
   needs('write'),
   wsAccess('admin'),
@@ -1369,7 +1434,7 @@ app.post(
   },
 );
 
-app.patch(
+api.patch(
   '/api/workspaces/:wsId/members/:userId',
   needs('write'),
   wsAccess('admin'),
@@ -1405,7 +1470,7 @@ app.patch(
   },
 );
 
-app.delete(
+api.delete(
   '/api/workspaces/:wsId/members/:userId',
   needs('write'),
   wsAccess('admin'),
@@ -1440,7 +1505,7 @@ app.delete(
  * newest first. Keyset-paginated with `?limit` (default 100, max 1000) and
  * `?before=<id>`. `?format=csv` streams a downloadable export instead of JSON.
  */
-app.get(
+api.get(
   '/api/workspaces/:wsId/audit',
   needs('read'),
   wsAccess('admin'),
@@ -1558,7 +1623,33 @@ const gitEnabled: express.RequestHandler = (_req, res, next) => {
   next();
 };
 
-app.get('/api/git/status', needs('read'), gitEnabled, async (_req, res) => {
+/**
+ * Gate git mutations behind the MARKUP_GIT_ADMINS allowlist (user ids and/or
+ * emails). Unset ⇒ open to any write-scoped principal, preserving zero-config
+ * self-hosting — with a startup warning making the exposure explicit.
+ */
+const gitAdminOnly: express.RequestHandler = (_req, res, next) => {
+  if (GIT_ADMINS.size === 0) {
+    next();
+    return;
+  }
+  const p = res.locals.principal as Principal;
+  if (p.kind === 'legacy') {
+    // The legacy shared token has no identity to check against the allowlist.
+    res.status(403).json({ error: 'git mutations require a signed-in identity' });
+    return;
+  }
+  if (
+    GIT_ADMINS.has(p.user.id.toLowerCase()) ||
+    (p.user.email && GIT_ADMINS.has(p.user.email.toLowerCase()))
+  ) {
+    next();
+    return;
+  }
+  res.status(403).json({ error: 'not in MARKUP_GIT_ADMINS' });
+};
+
+api.get('/api/git/status', needs('read'), gitEnabled, async (_req, res) => {
   try {
     res.json(await git!.status());
   } catch (err) {
@@ -1566,7 +1657,7 @@ app.get('/api/git/status', needs('read'), gitEnabled, async (_req, res) => {
   }
 });
 
-app.get('/api/git/branches', needs('read'), gitEnabled, async (_req, res) => {
+api.get('/api/git/branches', needs('read'), gitEnabled, async (_req, res) => {
   try {
     res.json({
       current: await git!.currentBranch(),
@@ -1577,7 +1668,7 @@ app.get('/api/git/branches', needs('read'), gitEnabled, async (_req, res) => {
   }
 });
 
-app.post('/api/git/commit', needs('write'), gitEnabled, async (req, res) => {
+api.post('/api/git/commit', needs('write'), gitEnabled, gitAdminOnly, async (req, res) => {
   const body = req.body as { message?: string; paths?: string[] };
   if (typeof body.message !== 'string' || !body.message.trim()) {
     res.status(400).json({ error: 'message is required' });
@@ -1594,7 +1685,7 @@ app.post('/api/git/commit', needs('write'), gitEnabled, async (req, res) => {
   }
 });
 
-app.post('/api/git/branch', needs('write'), gitEnabled, async (req, res) => {
+api.post('/api/git/branch', needs('write'), gitEnabled, gitAdminOnly, async (req, res) => {
   const body = req.body as { name?: string; checkout?: boolean };
   if (!isValidRef(body.name ?? '')) {
     res.status(400).json({ error: 'invalid branch name' });
@@ -1608,7 +1699,7 @@ app.post('/api/git/branch', needs('write'), gitEnabled, async (req, res) => {
   }
 });
 
-app.post('/api/git/checkout', needs('write'), gitEnabled, async (req, res) => {
+api.post('/api/git/checkout', needs('write'), gitEnabled, gitAdminOnly, async (req, res) => {
   const name = (req.body as { name?: string }).name;
   if (!isValidRef(name ?? '')) {
     res.status(400).json({ error: 'invalid branch name' });
@@ -1624,12 +1715,12 @@ app.post('/api/git/checkout', needs('write'), gitEnabled, async (req, res) => {
 
 // --- Edit history -------------------------------------------------------------
 
-app.get('/api/docs/:docId/versions', needs('read'), docAccess('read'), async (req, res) => {
+api.get('/api/docs/:docId/versions', needs('read'), docAccess('read'), async (req, res) => {
   res.json(await meta.listVersions(req.params.docId));
 });
 
 /** Give a version a human-friendly name (editorial action → write). */
-app.put('/api/docs/:docId/versions/:versionId', needs('write'), docAccess('write'), async (req, res) => {
+api.put('/api/docs/:docId/versions/:versionId', needs('write'), docAccess('write'), async (req, res) => {
   const name = (req.body as { name?: string })?.name;
   if (typeof name !== 'string' || !name.trim()) {
     res.status(400).json({ error: 'name (non-empty string) is required' });
@@ -1647,7 +1738,7 @@ app.put('/api/docs/:docId/versions/:versionId', needs('write'), docAccess('write
   res.json({ ok: true });
 });
 
-app.get('/api/docs/:docId/versions/:versionId', needs('read'), docAccess('read'), async (req, res) => {
+api.get('/api/docs/:docId/versions/:versionId', needs('read'), docAccess('read'), async (req, res) => {
   const content = await meta.getVersionContent(
     req.params.docId,
     Number(req.params.versionId),
@@ -1664,7 +1755,7 @@ app.get('/api/docs/:docId/versions/:versionId', needs('read'), docAccess('read')
  * minimal diff, so it flows to every connected client (and the CLI) like a
  * normal edit — and is itself undoable via history.
  */
-app.post('/api/docs/:docId/restore', needs('write'), docAccess('write'), async (req, res) => {
+api.post('/api/docs/:docId/restore', needs('write'), docAccess('write'), async (req, res) => {
   const versionId = Number((req.body as { versionId?: number })?.versionId);
   const content = await meta.getVersionContent(req.params.docId, versionId);
   if (content === undefined) {
@@ -1678,6 +1769,31 @@ app.post('/api/docs/:docId/restore', needs('write'), docAccess('write'), async (
   await conn.disconnect();
   res.json({ ok: true });
 });
+
+// Terminal error middleware (must be registered after every route): any
+// rejection funneled by `h` — or error passed to next() — lands here, so a
+// failing handler always produces a response instead of a hung socket.
+app.use(
+  (
+    err: unknown,
+    _req: express.Request,
+    res: express.Response,
+    _next: express.NextFunction,
+  ) => {
+    // Respect errors that carry their own status (e.g. body-parser's 400 on
+    // malformed JSON); anything else is a genuine internal error.
+    const status =
+      typeof (err as { status?: unknown })?.status === 'number'
+        ? (err as { status: number }).status
+        : 500;
+    if (status >= 500) logger.error({ err }, 'unhandled route error');
+    if (!res.headersSent) {
+      res.status(status).json({ error: status >= 500 ? 'internal error' : String((err as Error)?.message ?? 'bad request') });
+    } else {
+      res.end();
+    }
+  },
+);
 
 // --- Single port: HTTP for REST, WS upgrade for Yjs sync --------------------
 
@@ -1697,6 +1813,14 @@ const httpServer = app.listen(PORT, () => {
       'legacy shared MARKUP_TOKEN is active (full access, no identity) — ' +
         'deprecated. Use `mkp_` API tokens or SSO; unset MARKUP_TOKEN (or set ' +
         'MARKUP_REQUIRE_AUTH=1) to disable it.',
+    );
+  }
+  if (git && GIT_ADMINS.size === 0) {
+    logger.warn(
+      'git flows are enabled (MARKUP_REPO_DIR) with no MARKUP_GIT_ADMINS — ' +
+        'every write-scoped principal can commit/branch/checkout the repo. ' +
+        'Set MARKUP_GIT_ADMINS to a comma-separated list of user ids/emails ' +
+        'to restrict git mutations.',
     );
   }
 });

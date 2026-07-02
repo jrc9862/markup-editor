@@ -5,7 +5,7 @@ import { Command } from 'commander';
 import open from 'open';
 import { applyStringToYText } from '@markup/sync-core';
 import { createDoc, getDoc, renameDoc } from './api.js';
-import { connectDoc } from './client.js';
+import { connectDoc, whenFlushed } from './client.js';
 import { startDaemon, DISK_ORIGIN } from './daemon.js';
 import { loadManifest, saveManifest, manifestKey } from './manifest.js';
 import { hasState } from './state.js';
@@ -124,8 +124,9 @@ program
     });
     if (!offline) applyStringToYText(conn.ytext, diskContent, DISK_ORIGIN);
 
-    // ... give the provider a beat to flush, then write the merged result.
-    await new Promise((r) => setTimeout(r, 500));
+    // Wait for the provider to actually flush our changes (bounded, so a
+    // flaky link can't hang the command), then write the merged result.
+    await whenFlushed(conn.provider);
     fs.writeFileSync(abs, conn.ytext.toString());
 
     console.log(`[markup] synced ${file}`);

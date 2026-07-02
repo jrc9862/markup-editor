@@ -317,7 +317,11 @@ export function registerScimRoutes(
       return;
     }
     const body = (req.body ?? {}) as Record<string, unknown>;
-    const active = body.active === undefined ? true : scimBool(body.active);
+    // An absent `active` preserves the current state — a bare PUT (some IdPs
+    // send name-only replaces) must not silently reactivate a deprovisioned
+    // user.
+    const active =
+      body.active === undefined ? existing.active !== false : scimBool(body.active);
     const updated = await meta.updateUser(req.params.id, {
       name: nameFromUser(body) ?? existing.name,
       active,
