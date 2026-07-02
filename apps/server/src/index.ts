@@ -55,6 +55,7 @@ import {
 import { registerAuthRoutes, registerTokenRoutes } from './auth-routes.js';
 import { registerScimRoutes } from './scim.js';
 import { oidcFromEnv } from './oidc.js';
+import { samlFromEnv } from './saml.js';
 import { docEvents, extractMentions, type DocEvent } from './events.js';
 import { redisFromEnv, localEditorStore } from './redis.js';
 import { GitBridge, isValidRef } from './git.js';
@@ -111,6 +112,10 @@ const VERSION_RETENTION: RetentionPolicy = {
 // default — only trust the header when actually behind a proxy.
 const TRUST_PROXY = Number(process.env.MARKUP_TRUST_PROXY ?? 0);
 const OIDC = oidcFromEnv(SERVER_ORIGIN);
+// SAML 2.0 SSO (Phase 3): the final identity slice. Enabled when the IdP
+// endpoint + signing cert are set; unset ⇒ /auth/saml/* 404 and providers
+// report saml:false. Coexists with OIDC (a deployment may offer either).
+const SAML = samlFromEnv(SERVER_ORIGIN);
 // Git-native flows are enabled only when the server can reach a working tree
 // (MARKUP_REPO_DIR) — the self-hosted/local shape. Otherwise the routes 404.
 const git = GitBridge.fromEnv();
@@ -341,6 +346,7 @@ const apiLimiter = rateLimit({
 app.use('/auth', apiLimiter);
 registerAuthRoutes(app, meta, {
   oidc: OIDC,
+  saml: SAML,
   webOrigin: WEB_ORIGIN,
   secureCookies: SERVER_ORIGIN.startsWith('https'),
 });
