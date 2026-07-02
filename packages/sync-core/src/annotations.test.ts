@@ -23,6 +23,26 @@ function makeDoc(content: string) {
   return { doc, ytext };
 }
 
+describe('ids', () => {
+  it('generates unique uuid-shaped ids', () => {
+    const { doc, ytext } = makeDoc('hello world hello world');
+    const ids = new Set<string>();
+    for (let i = 0; i < 100; i++) {
+      const id = addComment(doc, ytext, {
+        from: 0,
+        to: 5,
+        author: 'a',
+        text: 't',
+      });
+      expect(id).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+      );
+      ids.add(id);
+    }
+    expect(ids.size).toBe(100);
+  });
+});
+
 describe('anchors', () => {
   it('round-trips an index', () => {
     const { doc, ytext } = makeDoc('hello world');

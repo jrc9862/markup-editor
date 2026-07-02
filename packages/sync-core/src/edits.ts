@@ -56,6 +56,13 @@ export interface FindReplaceOptions {
   caseSensitive?: boolean;
 }
 
+// Work bounds for find/replace, since `find` may be caller-supplied (the REST
+// surface): a pattern length cap and a match-count cap keep a hostile input
+// from burning unbounded CPU. A catastrophic-backtracking regex is the
+// residual risk — a hard guarantee would need re2 or a worker timeout.
+export const MAX_FIND_LENGTH = 1000;
+export const MAX_FIND_MATCHES = 100_000;
+
 /** Expand `$&`, `$1`..`$9`, and `$$` in a regex replacement template. */
 function expandTemplate(template: string, match: RegExpMatchArray): string {
   return template.replace(/\$(\$|&|\d{1,2})/g, (_full, token: string) => {
@@ -79,7 +86,16 @@ export function findReplaceEdits(
   opts: FindReplaceOptions = {},
 ): RangeEdit[] {
   if (!find) return [];
+  if (find.length > MAX_FIND_LENGTH) {
+    throw new Error(`find pattern too long (max ${MAX_FIND_LENGTH} chars)`);
+  }
   const edits: RangeEdit[] = [];
+  const push = (edit: RangeEdit) => {
+    if (edits.length >= MAX_FIND_MATCHES) {
+      throw new Error(`too many matches (max ${MAX_FIND_MATCHES})`);
+    }
+    edits.push(edit);
+  };
 
   if (opts.regex) {
     let flags = 'g';
@@ -87,7 +103,7 @@ export function findReplaceEdits(
     const re = new RegExp(find, flags);
     for (const m of content.matchAll(re)) {
       const from = m.index ?? 0;
-      edits.push({
+      push({
         from,
         to: from + m[0].length,
         insert: expandTemplate(replace, m),
@@ -100,7 +116,7 @@ export function findReplaceEdits(
   const needle = opts.caseSensitive ? find : find.toLowerCase();
   let idx = 0;
   while ((idx = hay.indexOf(needle, idx)) !== -1) {
-    edits.push({ from: idx, to: idx + find.length, insert: replace });
+    push({ from: idx, to: idx + find.length, insert: replace });
     idx += find.length || 1;
   }
   return edits;

@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { SqliteMetaStore } from './db.js';
 import {
+  canTouchSuggestion,
   effectiveScope,
   newApiTokenSecret,
   resolvePrincipal,
@@ -262,5 +263,40 @@ describe('roleFor with workspaces', () => {
     expect(await roleFor(store, asUser('admin'), doc)).toBe('editor'); // link role
     // member keeps only its explicit ACL grant (viewer, set above)
     expect(await roleFor(store, asUser('member'), doc)).toBe('viewer');
+  });
+});
+
+describe('canTouchSuggestion', () => {
+  const user = (id: string): Principal => ({
+    kind: 'user',
+    user: { id, email: `${id}@example.com`, name: id },
+    scope: 'write',
+  });
+  const mine = { authorId: 'u-1' };
+  const theirs = { authorId: 'u-2' };
+
+  it('legacy principals may touch any suggestion', () => {
+    expect(
+      canTouchSuggestion({ kind: 'legacy', scope: 'write' }, 'write', theirs),
+    ).toBe(true);
+  });
+
+  it('effective write capability on the doc may touch any suggestion', () => {
+    expect(canTouchSuggestion(user('u-1'), 'write', theirs)).toBe(true);
+  });
+
+  it('a suggester (write token, suggest-capped doc role) may touch only its own', () => {
+    // The regression this guards: the decision must use the *effective* doc
+    // capability, not the token scope (a signed-in user's token is always
+    // 'write').
+    expect(canTouchSuggestion(user('u-1'), 'suggest', mine)).toBe(true);
+    expect(canTouchSuggestion(user('u-1'), 'suggest', theirs)).toBe(false);
+  });
+
+  it('denies without effective access or authorship', () => {
+    expect(canTouchSuggestion(user('u-3'), null, theirs)).toBe(false);
+    expect(canTouchSuggestion(user('u-3'), 'read', { authorId: undefined })).toBe(
+      false,
+    );
   });
 });

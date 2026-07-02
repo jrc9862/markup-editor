@@ -31,6 +31,31 @@ export interface ConnectOptions {
   seedDisk?: string;
 }
 
+/**
+ * Resolve once the provider has flushed every pending local change to the
+ * server (`unsyncedChanges` reaches 0), or after `timeoutMs` on a flaky link
+ * so one-shot commands still terminate. Resolves immediately when already
+ * flushed.
+ */
+export function whenFlushed(
+  provider: HocuspocusProvider,
+  timeoutMs = 10_000,
+): Promise<void> {
+  if (provider.unsyncedChanges === 0) return Promise.resolve();
+  return new Promise((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      provider.off('unsyncedChanges', onChange);
+      resolve();
+    };
+    const onChange = (n: number) => {
+      if (n === 0) done();
+    };
+    const timer = setTimeout(done, timeoutMs);
+    provider.on('unsyncedChanges', onChange);
+  });
+}
+
 /** Connect to a document room as a headless Yjs client and wait for sync. */
 export function connectDoc(
   docId: string,
