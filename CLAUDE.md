@@ -281,6 +281,11 @@ healthcheck probes it).
   building while `next dev` runs leaves the dev server 500ing with
   MODULE_NOT_FOUND. Rely on `tsc --noEmit` + the dev compiler during work, or
   restart `next dev` (rm -rf .next) after a production build.
+- **Node version must match the native build.** `better-sqlite3` is a native
+  addon, so a `node_modules` installed under one Node major fails to load under
+  another (`ERR_DLOPEN_FAILED` / `NODE_MODULE_VERSION 115` vs `127`) and the
+  server dies on boot. CI, both Dockerfiles, and `.nvmrc` all pin Node 20 — use
+  `nvm use` here. If you do switch Node, run `npm rebuild better-sqlite3`.
 - **TipTap must stay on v2.** Bare `npm install @tiptap/extension-*` resolves
   v3, which peer-conflicts with `@tiptap/core@2` / `tiptap-markdown`. Always
   pin `@^2`.
