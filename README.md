@@ -178,10 +178,10 @@ linked phase docs.
 
 **`ERR_DLOPEN_FAILED` / `NODE_MODULE_VERSION` mismatch on `npm run dev:server`.**
 `better-sqlite3` is a native addon and must be built for the Node major you run.
-The project targets Node 20 (CI, Dockerfiles, `.nvmrc`):
+The project targets Node 22 (CI, Dockerfiles, `.nvmrc`):
 
 ```bash
-nvm use                          # picks up .nvmrc -> Node 20
+nvm use                          # picks up .nvmrc -> Node 22
 npm rebuild better-sqlite3       # only if you switched Node after installing
 ```
 

@@ -15,6 +15,6 @@
     "cli": "npm run --workspace @markup/cli start --"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   }
 }

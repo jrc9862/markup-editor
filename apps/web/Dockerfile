@@ -6,7 +6,7 @@
 #     --build-arg NEXT_PUBLIC_MARKUP_SERVER=https://markup.example.com \
 #     --build-arg NEXT_PUBLIC_MARKUP_TOKEN=... .
 
-FROM node:20 AS build
+FROM node:22 AS build
 WORKDIR /app
 
 COPY package.json package-lock.json tsconfig.base.json ./
@@ -26,7 +26,7 @@ ENV NEXT_PUBLIC_MARKUP_SERVER=$NEXT_PUBLIC_MARKUP_SERVER \
 RUN npm run build --workspace @markup/sync-core \
  && npm run build --workspace @markup/web
 
-FROM node:20-slim
+FROM node:22-slim
 ENV NODE_ENV=production
 WORKDIR /app
 # `output: 'standalone'` emits a self-contained server mirroring the monorepo

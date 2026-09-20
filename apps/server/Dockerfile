@@ -2,7 +2,7 @@
 # Full node image for the build (better-sqlite3 may compile from source);
 # slim image at runtime.
 
-FROM node:20 AS build
+FROM node:22 AS build
 WORKDIR /app
 
 COPY package.json package-lock.json tsconfig.base.json ./
@@ -16,7 +16,7 @@ RUN npm run build --workspace @markup/sync-core \
  && npm run build --workspace @markup/server \
  && npm prune --omit=dev
 
-FROM node:20-slim
+FROM node:22-slim
 ENV NODE_ENV=production
 # SQLite fallback files land here when DATABASE_URL is unset; mount a volume.
 ENV MARKUP_DATA_DIR=/data
