@@ -164,6 +164,28 @@ the comments at the top of that file for the full command. Load testing for
 that path lives in [`k6/`](./k6), covering WS connection capacity and REST
 throughput.
 
+### Which storage tier
+
+Storage is chosen by whether `DATABASE_URL` is set, and the choice sets a
+ceiling — pick by how you intend to run it, not by what is easiest to start.
+
+| | SQLite (`DATABASE_URL` unset) | Postgres (`DATABASE_URL` set) |
+| --- | --- | --- |
+| Use it for | Local dev, single-user, small self-hosted team on one box | Anything shared or long-lived |
+| Server replicas | One only | Many, with `REDIS_URL` |
+| Concurrent writes | One writer at a time, database-wide | Real concurrency |
+| Durability | A file on that container's disk — mount a volume or lose it | Managed by your database |
+
+SQLite is a genuine deployment tier, not a toy: one process, tens of thousands
+of documents, no ops burden. But it cannot be shared between server replicas,
+so the multi-node overlay above requires Postgres — a second replica reading a
+different node's local file is not a slower configuration, it is a broken one.
+Under a busy team on one node, the single-writer lock is what you will feel
+first, as `onStoreDocument` saves serialize.
+
+Both backends implement the same `MetaStore` interface, so moving up a tier is
+a config change, not a migration of application code.
+
 ## Configuration
 
 Zero config runs on SQLite with a dev token. For production, storage is
