@@ -209,4 +209,17 @@ npm rebuild better-sqlite3       # only if you switched Node after installing
 
 ## License
 
-No license file is currently published in this repository.
+[MIT with the Commons Clause](LICENSE).
+
+Use it, self-host it, modify it, build on it. What the Commons Clause removes is the
+right to **sell** it — you may not charge a third party for a product or service whose
+value comes substantially from this code, which explicitly includes hosting it as a
+paid service or selling support for it. Running it inside your own organization is
+fine. Everything else MIT grants still applies.
+
+That makes this source-available rather than open source: the Open Source Definition
+forbids exactly this kind of restriction. For a commercial license, ask.
+
+Dependencies keep their own licenses. All 493 installed packages are permissive — MIT,
+ISC, Apache-2.0, BSD, 0BSD, BlueOak — with one MPL-2.0 component (`@vercel/og`) bundled
+inside Next.js, whose file-level copyleft attaches only to that component.
