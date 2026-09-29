@@ -118,7 +118,7 @@ reach every connected human (and the CLI daemon → disk) in realtime:
   (owner only, into a workspace you belong to)
 - `GET /api/workspaces/:id/audit` — per-workspace audit log (admin only):
   administrative actions newest-first, keyset-paginated (`?limit`/`?before`),
-  `?format=csv` for a downloadable export (see PHASE3_AUDIT.md)
+  `?format=csv` for a downloadable export (see Design record · Audit log)
 - `GET /api/git/status` · `GET /api/git/branches` · `POST /api/git/commit`
   `{message,paths?}` · `POST /api/git/branch` `{name,checkout?}` ·
   `POST /api/git/checkout` `{name}` — only when `MARKUP_REPO_DIR` is set (404
@@ -126,7 +126,7 @@ reach every connected human (and the CLI daemon → disk) in realtime:
   (commit/branch/checkout) are additionally gated by `MARKUP_GIT_ADMINS`
   (comma-separated user ids/emails); unset ⇒ open to any write-scoped
   principal, with a startup warning
-- **SCIM 2.0 provisioning** (`/scim/v2/*`, Phase 3, see PHASE3_SCIM.md): a
+- **SCIM 2.0 provisioning** (`/scim/v2/*`, Phase 3, see Design record · SCIM mapping): a
   separate router for an IdP (Okta/Azure AD) — *not* the agent surface. Its own
   static bearer (`MARKUP_SCIM_TOKEN`; unset ⇒ the whole tree 404s, like the git
   routes), outside the `/api` principal guard. `Users` map onto `users`,
@@ -178,10 +178,10 @@ To exercise a full end-to-end loop: start server + web, then
 two tabs; edits must converge in both tabs *and* the file on disk. The REST
 agent surface can be smoke-tested with curl + `Authorization: Bearer dev-token`.
 
-Auth (Phase 1, see PHASE1_IDENTITY.md): three principal kinds — session
+Auth (Phase 1; schema in Design record): three principal kinds — session
 cookie (signed-in human; OIDC via `OIDC_ISSUER`/`OIDC_CLIENT_ID`/
 `OIDC_CLIENT_SECRET`, **SAML 2.0** via `SAML_ENTRY_POINT`/`SAML_IDP_CERT`
-(Phase 3, see PHASE3_SAML.md — SP-initiated POST binding at `/auth/saml/*`,
+(Phase 3, see Design record · SAML identity extraction — SP-initiated POST binding at `/auth/saml/*`,
 JIT-provisions the `users` row by asserted email; unset ⇒ those routes 404),
 or zero-setup dev sign-in `POST /auth/dev` when no SSO is
 configured), `mkp_`-prefixed API tokens (per-user/per-agent, scoped
@@ -207,7 +207,7 @@ the role, and the web client refetches `myRole` on every `synced` event
 (revoked users land on an access-revoked screen). The legacy shared token is off
 unless `MARKUP_TOKEN` is set, and `MARKUP_REQUIRE_AUTH=1` disables it even then.
 Legacy principals and pre-identity (unowned) docs behave as before: full
-access, open collaboration. **Workspaces** (Phase 3, see PHASE3_WORKSPACES.md):
+access, open collaboration. **Workspaces** (Phase 3, see Design record · Role resolution):
 a doc may belong to one workspace (`doc_meta.workspace_id`); `workspace_members`
 maps user→`admin`/`member`. The whole access impact is centralized in
 `roleFor()` (so it reaches REST + WS unchanged): a workspace admin acts as
@@ -216,7 +216,7 @@ maps user→`admin`/`member`. The whole access impact is centralized in
 above it (`strongerRole`). Managed via the `/api/workspaces` routes (create →
 admin; admin manages members and `defaultRole`; last-admin protected); deleting
 a workspace detaches its docs rather than orphaning them. A per-workspace
-**audit log** (Phase 3, see PHASE3_AUDIT.md; `audit_log` table on both backends,
+**audit log** (Phase 3, see Design record · Audit log; `audit_log` table on both backends,
 `MetaStore.appendAudit`/`listAudit`) records administrative actions
 (workspace/member changes, doc attach/detach) via a best-effort `audit()`
 side-call in those routes; admins read/export it at `GET .../audit`
@@ -274,6 +274,173 @@ persistence + REST latency histograms), and a liveness/readiness split —
 `/healthz` = process up, `/readyz` = `MetaStore.ping()` ok and not shutting
 down (so the LB drains a node before its connections close; compose's `server`
 healthcheck probes it).
+
+## Design record
+
+Folded in from the phase design docs, which are no longer in the tree. This is
+the schema, the decision rationale, and the non-goals — the parts that are not
+recoverable by reading the code.
+
+### Schema (both backends, ISO-8601 TEXT timestamps)
+
+```
+users             (id uuid pk, email unique, name, created_at,
+                   active INTEGER NOT NULL DEFAULT 1, external_id TEXT)
+sessions          (token_hash pk, user_id, created_at, expires_at)
+api_tokens        (id uuid pk, user_id, name, scope, token_hash unique,
+                   created_at, last_used_at)
+workspaces        (id pk, name, slug unique, default_role, created_at,
+                   external_id TEXT)
+workspace_members (workspace_id, user_id, role['admin'|'member'], created_at,
+                   PRIMARY KEY (workspace_id, user_id))
+doc_meta.workspace_id TEXT                -- nullable; null = personal/legacy doc
+audit_log         (id autoincrement/BIGSERIAL pk,  -- also the pagination cursor
+                   workspace_id NOT NULL, ts, actor_id, actor_name,
+                   action NOT NULL, target_type NOT NULL, target_id, detail)
+                  INDEX (workspace_id, id)  -- scoped keyset pagination
+```
+
+Sessions and tokens store only sha256 hashes; an API token's plaintext
+(`mkp_` + 48 hex) is shown once at creation. `audit_log.detail` is a JSON
+*string* on both backends (not JSONB) to keep the two stores byte-symmetric;
+`toAudit()` parses it on read. A missing `users.active` reads as active, so
+pre-SCIM rows are unaffected.
+
+### Role resolution — `roleFor()` precedence
+
+`auth.ts` `roleFor()` is the single function both `effectiveScope()` (every
+REST `docAccess` gate) and the WS `onAuthenticate` read-only decision call, so
+workspace roles reach REST and live sockets with no per-route changes:
+
+1. legacy principal → `owner`
+2. `doc.ownerId === user` → `owner` (the doc owner keeps control inside a workspace)
+3. workspace **admin** of `doc.workspaceId` → `owner`
+4. otherwise the **stronger** of {explicit ACL grant, workspace baseline}, where
+   the baseline is the workspace's `defaultRole` for a plain member — an owner's
+   ACL grant *promotes* a member above the baseline, and a weaker grant never
+   demotes below it (`strongerRole()` ranks by `roleScope`)
+5. no `ownerId` → `editor` (legacy open doc)
+6. else `doc.linkRole ?? 'editor'`
+
+Costs at most two extra store reads (`getMembership`, `getWorkspace`), and only
+when the doc carries a `workspaceId`. Guard: promoting, demoting or removing an
+admin refuses with `409` if it would drop the workspace's **last admin**.
+
+### Audit log — what is recorded
+
+| action | when | targetType | detail |
+|---|---|---|---|
+| `workspace.create` | `POST /api/workspaces` | workspace | `{name, defaultRole}` |
+| `workspace.update` | `PATCH /api/workspaces/:id` | workspace | changed fields |
+| `member.add` | `POST .../members` | member | `{email, role}` |
+| `member.update` | `PATCH .../members/:userId` | member | `{from, to}` |
+| `member.remove` | `DELETE .../members/:userId` | member | `{role}` |
+| `doc.attach` | `PATCH /api/docs/:id {workspaceId}` in | doc | `{name, from}` |
+| `doc.detach` | `PATCH /api/docs/:id {workspaceId}` out | doc | `{name, to}` |
+
+Moving a doc between workspaces records a `doc.detach` on the source *and* a
+`doc.attach` on the destination, so each workspace's log tells its own complete
+story. The actor is denormalized (`actorId` + `actorName`) so history survives a
+rename or deletion. The `audit()` helper is fire-and-forget — a logging failure
+is logged but never fails the action that triggered it.
+
+### SCIM mapping
+
+| SCIM resource | Markup entity | notes |
+|---|---|---|
+| User | `users` row | `userName` → email; `active` toggles access |
+| Group | `workspaces` row | `displayName` → name; new groups default to the `editor` baseline |
+| Group member | `workspace_members` | always role `member` — SCIM has no role concept |
+| `externalId` | `users`/`workspaces` `external_id` | the IdP's stable id, for idempotent lookup |
+
+Discovery endpoints (`/ServiceProviderConfig`, `/ResourceTypes`, `/Schemas`)
+exist because IdPs probe before syncing. The router does its own constant-time
+static-bearer check outside the `/api` principal guard — the IdP presents no
+session — and parses `application/scim+json`, which `express.json()` ignores.
+`DELETE /Users/:id` is a soft delete (deactivate + drop sessions, 204).
+
+### SAML identity extraction
+
+IdPs disagree on attribute names, so `identityFromProfile` probes in order and
+throws if no email is found (email is the user key):
+
+- **email**: `email`, `mail`, `emailAddress`, the WS-Fed claim URI, the
+  `urn:oid:0.9.2342.19200300.100.1.3` OID, and finally the `NameID` when it is
+  itself an email address.
+- **name**: `displayName`/`name` (+ claim URI + OID), else `givenName` +
+  `surname`/`sn`, else the email local-part.
+
+Email is lowercased so it matches whatever OIDC/SCIM/dev already stored;
+multi-valued attributes take the first usable string. Both SSO paths issue the
+same `markup_session` cookie through `startSession`/`sessionCookie`, so nothing
+downstream knows which one minted the session.
+
+### Deliberate decisions (and the reasoning)
+
+- **No Yjs state compaction.** The stored state is already a single GC'd
+  snapshot per doc (Hocuspocus upserts under `UNIQUE(name)`), not a replayable
+  update log — there is nothing to squash. The only further shrink would be
+  re-encoding under a fresh client id, which discards the CRDT history that lets
+  offline peers (the CLI's `.markup/state`) merge on reconnect. The real
+  unbounded vector was `doc_versions`, handled by retention.
+- **Retention invariants.** A user-named version is never pruned — naming pins
+  it. The most-recent version is never pruned, so a doc always keeps one
+  restorable point. Each cap disables independently at `<=0`.
+- **Restore is not size-guarded.** `POST /restore` replays already-stored,
+  already-bounded content, not new growth. Guarding it would lock users out of
+  their own history if the limit were later lowered.
+- **Readiness does not ping Redis.** A node with Redis briefly unreachable can
+  still serve its locally-loaded docs; failing readiness would drain *every*
+  node on a blip and turn partial degradation into a full outage. Redis health
+  is an alerting concern, not a readiness gate.
+- **The connection cap stays per-node and in-process.** Under Redis it becomes
+  a per-node WS cap, still a useful guard. Cross-node accounting would cost a
+  round-trip on every connect for little benefit.
+- **REST reads are eventually consistent across nodes.** `openDirectConnection`
+  loads the doc on the handling node and the Redis extension syncs it from
+  peers, so a read issued microseconds after a write on another node can
+  momentarily miss it. Acceptable for the agent surface; WS is the realtime path.
+- **`/metrics` is open by default** — standard for an internal scrape target.
+  Restrict at the network layer or set `MARKUP_METRICS_TOKEN`.
+- **No `workspace.delete` audit entry.** Deleting a workspace cascade-deletes
+  its audit rows, which only its admins could read, so a terminal entry would be
+  immediately unreadable. Export first, then delete.
+- **Content edits stay out of the audit log.** They are already captured by
+  `doc_versions` (with attribution) and the SSE event stream; re-logging would
+  duplicate both and make the table unbounded.
+- **SCIM provisions plain members only.** SCIM has no workspace-admin concept,
+  so in-app admin promotion is unchanged and a SCIM-created workspace is fully
+  IdP-governed. `PUT`/replace never strips an in-app admin.
+- **SAML carries no state cookie** (unlike OIDC's state/nonce/PKCE verifier):
+  the assertion is self-verifying, with `wantAssertionsSigned: true` as the
+  security-critical bit. `validateInResponseTo` stays off, so login is stateless
+  across a multi-node deployment with no shared replay cache.
+- **Deprovisioning has one enforcement point.** `resolvePrincipal` returns
+  `null` for an inactive user, and both WS `onAuthenticate` and every REST route
+  funnel through it, so one check locks both surfaces. Sessions are dropped on
+  deactivate; the row is kept so attribution survives.
+
+### Backups (runbook)
+
+- **Postgres.** `scripts/backup.sh` runs `pg_dump --format=custom`. For low RPO,
+  layer WAL archiving / PITR at the provider or database level. Restore with
+  `pg_restore --clean --if-exists -d "$DATABASE_URL" <dump>`.
+- **SQLite.** `scripts/backup.sh` uses the online `.backup` command, which is
+  consistent against a running server (unlike `cp`). Restore by stopping the
+  server and copying the files back into `MARKUP_DATA_DIR`.
+- **Back up both stores together.** `markup-docs` holds Yjs document state (the
+  live content); `markup-meta` holds doc metadata, ACLs, tokens/sessions and
+  version history. A meta dump without the matching doc state restores names and
+  permissions but not content.
+
+### Load testing
+
+Aim VUs at ~2× expected peak. One k6 process will not sustain a
+10k-connection target — run `ws.js` across multiple processes; the scenario
+composes cleanly across instances. Connection capacity and edit throughput are
+split deliberately: generating valid Yjs binary updates in raw k6 is
+impractical, so `ws.js` opens/authenticates/syncs/holds while `rest.js` drives
+writes through REST.
 
 ## Gotchas (learned the hard way)
 
@@ -428,21 +595,21 @@ way), mono accents (CSS vars in `globals.css`).
 1. **Accounts & sharing permissions** — milestones 1+2 shipped (OIDC/dev
    sign-in, sessions, scoped tokens, attribution, per-doc roles + ACL with
    server-side REST/WS enforcement, MARKUP_REQUIRE_AUTH; see
-   PHASE1_IDENTITY.md), plus the role-aware web UI (Share popover, role
+   the Design record), plus the role-aware web UI (Share popover, role
    badge, read-only editor below editor role with REST-backed annotations).
    Workspace membership shipped as Phase 3 slice 1 (server + REST; see
-   PHASE3_WORKSPACES.md), with the workspace web UI as slice 2 (home-page
+   the Design record), with the workspace web UI as slice 2 (home-page
    Workspaces section + member management + move-doc-into-workspace in the
    Share popover) and a per-workspace audit log as slice 3 (server + REST;
-   see PHASE3_AUDIT.md). Slice 4 surfaced the audit log in the web UI: an
+   see the Design record). Slice 4 surfaced the audit log in the web UI: an
    admin-only "Audit log" viewer inside each `WorkspacesPanel` card (paginated
    "Load more" + CSV export via `lib/workspaces.ts` `listAudit`/`fetchAuditCsv`).
    Slice 5 shipped SCIM 2.0 provisioning (`/scim/v2/*`, gated by
-   `MARKUP_SCIM_TOKEN`; server + REST; see PHASE3_SCIM.md) — Users→`users`,
+   `MARKUP_SCIM_TOKEN`; server + REST; see the Design record) — Users→`users`,
    Groups→workspaces, deprovision = `active:false` enforced at
    `resolvePrincipal`. Slice 6 shipped SAML 2.0 SSO (`/auth/saml/*`, gated by
    `SAML_ENTRY_POINT`+`SAML_IDP_CERT`; server + web sign-in button; see
-   PHASE3_SAML.md) — SP-initiated HTTP-POST binding via `@node-saml/node-saml`,
+   the Design record) — SP-initiated HTTP-POST binding via `@node-saml/node-saml`,
    the validated assertion JIT-provisions a `users` row by email and issues the
    same session cookie OIDC does. Finally, the legacy shared `MARKUP_TOKEN` was
    retired as a default: it has no built-in value anymore, so it works only when
@@ -461,7 +628,7 @@ way), mono accents (CSS vars in `globals.css`).
    topology in `docker-compose.scale.yml` + `deploy/nginx.conf`. Plus k6 load
    testing (`k6/` — `ws.js` connection-capacity + `rest.js` throughput, sharing
    a minimal Hocuspocus wire codec in `k6/lib/hocuspocus.js`; manual CI in
-   `.github/workflows/loadtest.yml`). Phase 2 is complete (see PHASE2_OPS.md).
+   `.github/workflows/loadtest.yml`). Phase 2 is complete.
 
 Shipped from the original roadmap: togglable realtime suggestion mode
 (both source and rendered modes), in-rendered-view annotation highlights,

@@ -5,7 +5,7 @@
 # Postgres (DATABASE_URL set): logical dump via pg_dump (custom format, so
 #   pg_restore can do selective/parallel restores). This is the production
 #   path; pair it with the provider's PITR/WAL archiving for sub-dump RPO
-#   (see PHASE2_OPS.md "Backups").
+#   (see CLAUDE.md, "Design record · Backups (runbook)").
 # SQLite (DATABASE_URL unset): online `.backup` of both stores — markup-docs
 #   (Yjs state, written by the Hocuspocus SQLite extension) and markup-meta
 #   (doc metadata + version history). `.backup` is consistent against a live
