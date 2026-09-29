@@ -4,10 +4,8 @@
 
 <img src="assets/banner.jpg" alt="Markup — real-time multiplayer editing on portable .md files" width="100%">
 
-**Real-time multiplayer editing on plain `.md` files.** The document you
-collaborate on in the browser *is* the file in your repo: a two-way CLI keeps
-the browser, your file system, and git in sync — no copy-paste tax, clean
-diffs.
+**Real-time multiplayer editing on plain `.md` files.** 
+The document you collaborate on in the browser *is* the file in your repo: a two-way CLI keeps the browser, your file system, and git in sync — no copy-paste tax, clean diffs.
 
 **Agents are a first-class audience, not an afterthought.** Every human
 capability has a plain-REST equivalent, locations can be addressed by quoting
